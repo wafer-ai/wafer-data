@@ -1,0 +1,268 @@
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+os.environ["CXX"] = "hipcc"
+
+# Optimized fused kernels for attention block
+fused_kernels_source = """
+#include <hip/hip_runtime.h>
+#include <torch/extension.h>
+#include <cmath>
+
+#define WARP_SIZE 64
+#define BLOCK_SIZE 256
+
+// Fused residual add + LayerNorm kernel with vectorized loads
+__global__ void fused_residual_layernorm_vec4_kernel(
+    const float4* __restrict__ attn_out,
+    const float4* __restrict__ residual,
+    const float4* __restrict__ weight,
+    const float4* __restrict__ bias,
+    float4* __restrict__ out,
+    int num_elements,
+    int embed_dim_vec4,
+    float eps
+) {
+    int idx = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    int base_offset = idx * embed_dim_vec4;
+    
+    float local_sum = 0.0f;
+    float local_sum_sq = 0.0f;
+    
+    // Process 4 floats at a time
+    for (int i = tid; i < embed_dim_vec4; i += blockDim.x) {
+        float4 a = attn_out[base_offset + i];
+        float4 r = residual[base_offset + i];
+        
+        float v0 = a.x + r.x;
+        float v1 = a.y + r.y;
+        float v2 = a.z + r.z;
+        float v3 = a.w + r.w;
+        
+        local_sum += v0 + v1 + v2 + v3;
+        local_sum_sq += v0*v0 + v1*v1 + v2*v2 + v3*v3;
+    }
+    
+    // Warp-level reduction
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        local_sum += __shfl_down(local_sum, offset, WARP_SIZE);
+        local_sum_sq += __shfl_down(local_sum_sq, offset, WARP_SIZE);
+    }
+    
+    __shared__ float s_sum[BLOCK_SIZE / WARP_SIZE];
+    __shared__ float s_sum_sq[BLOCK_SIZE / WARP_SIZE];
+    
+    int lane = tid % WARP_SIZE;
+    int warp_id = tid / WARP_SIZE;
+    
+    if (lane == 0) {
+        s_sum[warp_id] = local_sum;
+        s_sum_sq[warp_id] = local_sum_sq;
+    }
+    __syncthreads();
+    
+    if (warp_id == 0) {
+        local_sum = (lane < (BLOCK_SIZE / WARP_SIZE)) ? s_sum[lane] : 0.0f;
+        local_sum_sq = (lane < (BLOCK_SIZE / WARP_SIZE)) ? s_sum_sq[lane] : 0.0f;
+        
+        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+            local_sum += __shfl_down(local_sum, offset, WARP_SIZE);
+            local_sum_sq += __shfl_down(local_sum_sq, offset, WARP_SIZE);
+        }
+    }
+    
+    __shared__ float mean, inv_std;
+    if (tid == 0) {
+        int embed_dim = embed_dim_vec4 * 4;
+        mean = local_sum / embed_dim;
+        float variance = local_sum_sq / embed_dim - mean * mean;
+        inv_std = rsqrtf(variance + eps);
+    }
+    __syncthreads();
+    
+    // Apply normalization with vectorized writes
+    for (int i = tid; i < embed_dim_vec4; i += blockDim.x) {
+        float4 a = attn_out[base_offset + i];
+        float4 r = residual[base_offset + i];
+        float4 w = weight[i];
+        float4 b = bias[i];
+        
+        float4 result;
+        result.x = ((a.x + r.x) - mean) * inv_std * w.x + b.x;
+        result.y = ((a.y + r.y) - mean) * inv_std * w.y + b.y;
+        result.z = ((a.z + r.z) - mean) * inv_std * w.z + b.z;
+        result.w = ((a.w + r.w) - mean) * inv_std * w.w + b.w;
+        
+        out[base_offset + i] = result;
+    }
+}
+
+// Non-vectorized fallback
+__global__ void fused_residual_layernorm_kernel(
+    const float* __restrict__ attn_out,
+    const float* __restrict__ residual,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* __restrict__ out,
+    int embed_dim,
+    float eps
+) {
+    int idx = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    int base_offset = idx * embed_dim;
+    
+    float local_sum = 0.0f;
+    float local_sum_sq = 0.0f;
+    
+    for (int i = tid; i < embed_dim; i += blockDim.x) {
+        float val = attn_out[base_offset + i] + residual[base_offset + i];
+        local_sum += val;
+        local_sum_sq += val * val;
+    }
+    
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        local_sum += __shfl_down(local_sum, offset, WARP_SIZE);
+        local_sum_sq += __shfl_down(local_sum_sq, offset, WARP_SIZE);
+    }
+    
+    __shared__ float s_sum[BLOCK_SIZE / WARP_SIZE];
+    __shared__ float s_sum_sq[BLOCK_SIZE / WARP_SIZE];
+    
+    int lane = tid % WARP_SIZE;
+    int warp_id = tid / WARP_SIZE;
+    
+    if (lane == 0) {
+        s_sum[warp_id] = local_sum;
+        s_sum_sq[warp_id] = local_sum_sq;
+    }
+    __syncthreads();
+    
+    if (warp_id == 0) {
+        local_sum = (lane < (BLOCK_SIZE / WARP_SIZE)) ? s_sum[lane] : 0.0f;
+        local_sum_sq = (lane < (BLOCK_SIZE / WARP_SIZE)) ? s_sum_sq[lane] : 0.0f;
+        
+        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+            local_sum += __shfl_down(local_sum, offset, WARP_SIZE);
+            local_sum_sq += __shfl_down(local_sum_sq, offset, WARP_SIZE);
+        }
+    }
+    
+    __shared__ float mean, inv_std;
+    if (tid == 0) {
+        mean = local_sum / embed_dim;
+        float variance = local_sum_sq / embed_dim - mean * mean;
+        inv_std = rsqrtf(variance + eps);
+    }
+    __syncthreads();
+    
+    for (int i = tid; i < embed_dim; i += blockDim.x) {
+        float val = attn_out[base_offset + i] + residual[base_offset + i];
+        float normalized = (val - mean) * inv_std;
+        out[base_offset + i] = normalized * weight[i] + bias[i];
+    }
+}
+
+torch::Tensor fused_residual_layernorm_hip(
+    torch::Tensor attn_out,
+    torch::Tensor residual,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    float eps
+) {
+    int seq_len = attn_out.size(0);
+    int batch_size = attn_out.size(1);
+    int embed_dim = attn_out.size(2);
+    
+    auto out = torch::empty_like(attn_out);
+    
+    int num_blocks = seq_len * batch_size;
+    int block_size = BLOCK_SIZE;
+    
+    if (embed_dim % 4 == 0) {
+        fused_residual_layernorm_vec4_kernel<<<num_blocks, block_size>>>(
+            reinterpret_cast<const float4*>(attn_out.data_ptr<float>()),
+            reinterpret_cast<const float4*>(residual.data_ptr<float>()),
+            reinterpret_cast<const float4*>(weight.data_ptr<float>()),
+            reinterpret_cast<const float4*>(bias.data_ptr<float>()),
+            reinterpret_cast<float4*>(out.data_ptr<float>()),
+            num_blocks,
+            embed_dim / 4,
+            eps
+        );
+    } else {
+        fused_residual_layernorm_kernel<<<num_blocks, block_size>>>(
+            attn_out.data_ptr<float>(),
+            residual.data_ptr<float>(),
+            weight.data_ptr<float>(),
+            bias.data_ptr<float>(),
+            out.data_ptr<float>(),
+            embed_dim,
+            eps
+        );
+    }
+    
+    return out;
+}
+"""
+
+fused_kernels_cpp = """
+torch::Tensor fused_residual_layernorm_hip(
+    torch::Tensor attn_out,
+    torch::Tensor residual,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    float eps
+);
+"""
+
+fused_module = load_inline(
+    name="fused_attention_kernels_v4",
+    cpp_sources=fused_kernels_cpp,
+    cuda_sources=fused_kernels_source,
+    functions=["fused_residual_layernorm_hip"],
+    verbose=True,
+    extra_cuda_cflags=["-O3", "-ffast-math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        """
+        Attention Block using Multihead Self-Attention with fused operations.
+        :param embed_dim: Embedding dimension (the number of channels)
+        :param num_heads: Number of attention heads
+        """
+        super(ModelNew, self).__init__()
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.fused_module = fused_module
+        self.eps = self.norm.eps
+
+    def forward(self, x):
+        """
+        Forward pass of the AttentionBlock.
+        :param x: Input tensor of shape (B, C, H, W)
+        :return: Output tensor of the same shape (B, C, H, W)
+        """
+        B, C, H, W = x.shape
+        x = x.view(B, C, H * W).permute(2, 0, 1)  # (seq_len, batch_size, embed_dim)
+        
+        attn_output, _ = self.attn(x, x, x)
+        
+        # Fused residual add + LayerNorm with vectorized access
+        x = self.fused_module.fused_residual_layernorm_hip(
+            attn_output.contiguous(), 
+            x.contiguous(),
+            self.norm.weight,
+            self.norm.bias,
+            self.eps
+        )
+        
+        x = x.permute(1, 2, 0).view(B, C, H, W)
+        return x

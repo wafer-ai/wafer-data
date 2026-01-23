@@ -1,0 +1,308 @@
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+os.environ["CXX"] = "hipcc"
+
+from torch.utils.cpp_extension import load_inline
+
+# Fused delta rule kernel for the recurrence
+gated_deltanet_cpp_source = """
+#include <torch/extension.h>
+#include <hip/hip_runtime.h>
+
+// Fused kernel for delta rule update: processes the entire sequence
+// Each thread block handles one (batch, head) pair
+// Iterates sequentially through time but parallelizes across state matrix
+
+__global__ void gated_deltanet_recurrence_kernel(
+    const float* __restrict__ q,      // (batch, seq, heads, d_qk)
+    const float* __restrict__ k,      // (batch, seq, heads, d_qk)
+    const float* __restrict__ v,      // (batch, seq, heads, d_v)
+    const float* __restrict__ alpha,  // (batch, seq, heads)
+    const float* __restrict__ beta,   // (batch, seq, heads)
+    float* __restrict__ output,       // (batch, seq, heads, d_v)
+    int batch_size,
+    int seq_len,
+    int num_heads,
+    int d_qk,
+    int d_v
+) {
+    // Each block handles one (batch, head) pair
+    int batch_idx = blockIdx.x;
+    int head_idx = blockIdx.y;
+    
+    if (batch_idx >= batch_size || head_idx >= num_heads) return;
+    
+    // Shared memory for state matrix S[d_v][d_qk] and temporary values
+    extern __shared__ float shared_mem[];
+    float* S = shared_mem;  // d_v * d_qk
+    float* k_cache = S + d_v * d_qk;  // d_qk
+    float* v_cache = k_cache + d_qk;  // d_v
+    float* S_k = v_cache + d_v;  // d_v (S @ k result)
+    
+    int tid = threadIdx.x;
+    int total_threads = blockDim.x;
+    
+    // Initialize state to zero
+    for (int i = tid; i < d_v * d_qk; i += total_threads) {
+        S[i] = 0.0f;
+    }
+    __syncthreads();
+    
+    // Process each timestep sequentially
+    for (int t = 0; t < seq_len; t++) {
+        // Base indices for this timestep
+        int qkv_base = ((batch_idx * seq_len + t) * num_heads + head_idx);
+        int alpha_beta_base = (batch_idx * seq_len + t) * num_heads + head_idx;
+        
+        // Load k and v into shared memory
+        for (int i = tid; i < d_qk; i += total_threads) {
+            k_cache[i] = k[qkv_base * d_qk + i];
+        }
+        for (int i = tid; i < d_v; i += total_threads) {
+            v_cache[i] = v[qkv_base * d_v + i];
+        }
+        __syncthreads();
+        
+        float alpha_t = alpha[alpha_beta_base];
+        float beta_t = beta[alpha_beta_base];
+        
+        // Compute S @ k -> S_k (d_v vector)
+        for (int i = tid; i < d_v; i += total_threads) {
+            float sum = 0.0f;
+            for (int j = 0; j < d_qk; j++) {
+                sum += S[i * d_qk + j] * k_cache[j];
+            }
+            S_k[i] = sum;
+        }
+        __syncthreads();
+        
+        // Update state: S = alpha * S - beta * (S_k - v) @ k^T
+        // S[i][j] = alpha * S[i][j] - beta * (S_k[i] - v[i]) * k[j]
+        for (int idx = tid; idx < d_v * d_qk; idx += total_threads) {
+            int i = idx / d_qk;
+            int j = idx % d_qk;
+            float error_i = S_k[i] - v_cache[i];
+            S[idx] = alpha_t * S[idx] - beta_t * error_i * k_cache[j];
+        }
+        __syncthreads();
+        
+        // Compute output: o = S @ q
+        // Load q
+        for (int i = tid; i < d_qk; i += total_threads) {
+            k_cache[i] = q[qkv_base * d_qk + i];  // Reuse k_cache for q
+        }
+        __syncthreads();
+        
+        int out_base = qkv_base * d_v;
+        for (int i = tid; i < d_v; i += total_threads) {
+            float sum = 0.0f;
+            for (int j = 0; j < d_qk; j++) {
+                sum += S[i * d_qk + j] * k_cache[j];
+            }
+            output[out_base + i] = sum;
+        }
+        __syncthreads();
+    }
+}
+
+torch::Tensor gated_deltanet_recurrence(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor alpha,
+    torch::Tensor beta
+) {
+    int batch_size = q.size(0);
+    int seq_len = q.size(1);
+    int num_heads = q.size(2);
+    int d_qk = q.size(3);
+    int d_v = v.size(3);
+    
+    auto output = torch::zeros({batch_size, seq_len, num_heads, d_v}, q.options());
+    
+    // Grid: (batch_size, num_heads)
+    dim3 grid(batch_size, num_heads);
+    
+    // Block size - use enough threads to cover the state matrix
+    int block_size = 256;
+    
+    // Shared memory: S[d_v * d_qk] + k[d_qk] + v[d_v] + S_k[d_v]
+    size_t shared_mem_size = (d_v * d_qk + d_qk + d_v + d_v) * sizeof(float);
+    
+    gated_deltanet_recurrence_kernel<<<grid, block_size, shared_mem_size>>>(
+        q.data_ptr<float>(),
+        k.data_ptr<float>(),
+        v.data_ptr<float>(),
+        alpha.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        seq_len,
+        num_heads,
+        d_qk,
+        d_v
+    );
+    
+    return output;
+}
+"""
+
+gated_deltanet_cpp_header = """
+torch::Tensor gated_deltanet_recurrence(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor alpha,
+    torch::Tensor beta
+);
+"""
+
+gated_deltanet_module = load_inline(
+    name="gated_deltanet",
+    cpp_sources=gated_deltanet_cpp_header,
+    cuda_sources=gated_deltanet_cpp_source,
+    functions=["gated_deltanet_recurrence"],
+    verbose=True,
+    extra_cuda_cflags=["-O3"],
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized Gated DeltaNet with fused HIP kernel for the recurrence.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        head_dim_qk: int,
+        head_dim_v: int,
+        use_short_conv: bool = True,
+        conv_kernel_size: int = 4,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim_qk = head_dim_qk
+        self.head_dim_v = head_dim_v
+        self.use_short_conv = use_short_conv
+
+        # Q, K, V projections
+        self.q_proj = nn.Linear(hidden_size, num_heads * head_dim_qk, bias=False)
+        self.k_proj = nn.Linear(hidden_size, num_heads * head_dim_qk, bias=False)
+        self.v_proj = nn.Linear(hidden_size, num_heads * head_dim_v, bias=False)
+
+        # Gating projections
+        self.a_proj = nn.Linear(hidden_size, num_heads, bias=True)
+        self.b_proj = nn.Linear(hidden_size, num_heads, bias=True)
+
+        # Output projection
+        self.o_proj = nn.Linear(num_heads * head_dim_v, hidden_size, bias=False)
+
+        # Optional short convolution for local context
+        if use_short_conv:
+            self.q_conv = nn.Conv1d(
+                num_heads * head_dim_qk, num_heads * head_dim_qk,
+                kernel_size=conv_kernel_size, groups=num_heads * head_dim_qk,
+                padding=conv_kernel_size - 1
+            )
+            self.k_conv = nn.Conv1d(
+                num_heads * head_dim_qk, num_heads * head_dim_qk,
+                kernel_size=conv_kernel_size, groups=num_heads * head_dim_qk,
+                padding=conv_kernel_size - 1
+            )
+            self.v_conv = nn.Conv1d(
+                num_heads * head_dim_v, num_heads * head_dim_v,
+                kernel_size=conv_kernel_size, groups=num_heads * head_dim_v,
+                padding=conv_kernel_size - 1
+            )
+
+        # Output gate with LayerNorm
+        self.g_proj = nn.Linear(hidden_size, num_heads * head_dim_v, bias=False)
+        self.o_norm = nn.LayerNorm(head_dim_v)
+
+        # Scaling factor for keys
+        self.scale = head_dim_qk ** -0.5
+        
+        self.gated_deltanet = gated_deltanet_module
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+
+        # Project to Q, K, V
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        # Optional short convolution
+        if self.use_short_conv:
+            q = self.q_conv(q.transpose(1, 2))[:, :, :seq_len].transpose(1, 2)
+            k = self.k_conv(k.transpose(1, 2))[:, :, :seq_len].transpose(1, 2)
+            v = self.v_conv(v.transpose(1, 2))[:, :, :seq_len].transpose(1, 2)
+            q = F.silu(q)
+            k = F.silu(k)
+            v = F.silu(v)
+
+        # Reshape for multi-head attention
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim_qk).contiguous()
+        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim_qk).contiguous()
+        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim_v).contiguous()
+
+        # Compute gating values
+        alpha = torch.sigmoid(self.a_proj(x))  # (batch, seq, num_heads)
+        beta = torch.sigmoid(self.b_proj(x))   # (batch, seq, num_heads)
+
+        # Scale keys
+        k = k * self.scale
+
+        # Use fused HIP kernel for recurrence
+        o = self.gated_deltanet.gated_deltanet_recurrence(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            alpha.contiguous(),
+            beta.contiguous()
+        )
+
+        # Apply output normalization per head
+        o = self.o_norm(o)
+
+        # Apply output gate
+        g = torch.sigmoid(self.g_proj(x))
+        g = g.view(batch_size, seq_len, self.num_heads, self.head_dim_v)
+        o = o * g
+
+        # Reshape and project output
+        o = o.reshape(batch_size, seq_len, self.num_heads * self.head_dim_v)
+        o = self.o_proj(o)
+
+        return o
+
+
+# Configuration
+batch_size = 4
+seq_len = 2048
+hidden_size = 2048
+num_heads = 16
+head_dim_qk = 128
+head_dim_v = 128
+
+
+def get_inputs():
+    return [torch.randn(batch_size, seq_len, hidden_size)]
+
+
+def get_init_inputs():
+    return [hidden_size, num_heads, head_dim_qk, head_dim_v]
+
+
+def custom_kernel(inputs):
+    x = inputs[0].cuda()
+    model = ModelNew(*get_init_inputs()).cuda().eval()
+    with torch.no_grad():
+        return model(x)

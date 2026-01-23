@@ -1,0 +1,964 @@
+{
+  "id": "sample_0013",
+  "index": null,
+  "group_index": null,
+  "input": {
+    "level": "level2",
+    "problem_id": 97,
+    "problem_path": "/root/Wafer/research/KernelBench/KernelBench/level2/98_Matmul_AvgPool_GELU_Scale_Max.py",
+    "ref_arch_src": "import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    \"\"\"\n    A model implementing the pattern \"Matmul_AvgPool_GELU_Scale_Max\".\n    \"\"\"\n    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):\n        super(Model, self).__init__()\n        self.matmul = nn.Linear(in_features, out_features)\n        self.avg_pool = nn.AvgPool1d(kernel_size=pool_kernel_size)\n        self.scale_factor = scale_factor\n\n    def forward(self, x):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, in_features).\n\n        Returns:\n            torch.Tensor: Output tensor of shape (batch_size, out_features).\n        \"\"\"\n        x = self.matmul(x)\n        x = self.avg_pool(x.unsqueeze(1)).squeeze(1)\n        x = torch.nn.functional.gelu(x)\n        x = x * self.scale_factor\n        x = torch.max(x, dim=1).values\n        return x\n\nbatch_size = 1024\nin_features = 8192\nout_features = 8192\npool_kernel_size = 16\nscale_factor = 2.0\n\ndef get_inputs():\n    return [torch.rand(batch_size, in_features)]\n\ndef get_init_inputs():\n    return [in_features, out_features, pool_kernel_size, scale_factor]",
+    "name": "98_Matmul_AvgPool_GELU_Scale_Max",
+    "expected_answer": "import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    \"\"\"\n    A model implementing the pattern \"Matmul_AvgPool_GELU_Scale_Max\".\n    \"\"\"\n    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):\n        super(Model, self).__init__()\n        self.matmul = nn.Linear(in_features, out_features)\n        self.avg_pool = nn.AvgPool1d(kernel_size=pool_kernel_size)\n        self.scale_factor = scale_factor\n\n    def forward(self, x):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, in_features).\n\n        Returns:\n            torch.Tensor: Output tensor of shape (batch_size, out_features).\n        \"\"\"\n        x = self.matmul(x)\n        x = self.avg_pool(x.unsqueeze(1)).squeeze(1)\n        x = torch.nn.functional.gelu(x)\n        x = x * self.scale_factor\n        x = torch.max(x, dim=1).values\n        return x\n\nbatch_size = 1024\nin_features = 8192\nout_features = 8192\npool_kernel_size = 16\nscale_factor = 2.0\n\ndef get_inputs():\n    return [torch.rand(batch_size, in_features)]\n\ndef get_init_inputs():\n    return [in_features, out_features, pool_kernel_size, scale_factor]",
+    "user_prompt": "Optimize the HIP kernel for 98_Matmul_AvgPool_GELU_Scale_Max",
+    "_sample_id": "sample_0013"
+  },
+  "prompt": "",
+  "ground_truth": null,
+  "trajectory": {
+    "completions": [
+      {
+        "id": "google-1769031540",
+        "object": "chat.completion",
+        "created": 1769031540,
+        "model": "gemini-3-flash-preview",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        },
+        "kv_transfer_params": null,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "toolCall",
+                  "id": "write_1769031540_1",
+                  "name": "write",
+                  "arguments": {
+                    "content": "\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nimport os\n\nos.environ[\"CXX\"] = \"hipcc\"\n\nfused_ops_cpp_source = \"\"\"\n#include <hip/hip_runtime.h>\n#include <torch/extension.h>\n#include <cmath>\n#include <algorithm>\n\n__device__ inline float gelu(float x) {\n    return 0.5f * x * (1.0f + erff(x * M_SQRT1_2));\n}\n\n__global__ void fused_ops_kernel(\n    const float* __restrict__ input,\n    float* __restrict__ output,\n    int batch_size,\n    int out_features,\n    int pool_kernel_size,\n    float scale_factor,\n    int num_pooled) {\n\n    int row = blockIdx.x;\n    if (row >= batch_size) return;\n\n    extern __shared__ float shared_data[];\n\n    float max_val = -1e20f;\n    \n    // Each thread calculates one or more pooled values\n    for (int i = threadIdx.x; i < num_pooled; i += blockDim.x) {\n        float sum = 0.0f;\n        int start_idx = i * pool_kernel_size;\n        for (int k = 0; k < pool_kernel_size; ++k) {\n            sum += input[row * out_features + start_idx + k];\n        }\n        float avg = sum / (float)pool_kernel_size;\n        float val = gelu(avg) * scale_factor;\n        if (val > max_val) max_val = val;\n    }\n\n    // Now reduce max_val within the block\n    shared_data[threadIdx.x] = max_val;\n    __syncthreads();\n\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (threadIdx.x < stride) {\n            shared_data[threadIdx.x] = fmaxf(shared_data[threadIdx.x], shared_data[threadIdx.x + stride]);\n        }\n        __syncthreads();\n    }\n\n    if (threadIdx.x == 0) {\n        output[row] = shared_data[0];\n    }\n}\n\ntorch::Tensor fused_ops_hip(torch::Tensor input, int pool_kernel_size, float scale_factor) {\n    int batch_size = input.size(0);\n    int out_features = input.size(1);\n    int num_pooled = out_features / pool_kernel_size;\n    \n    auto output = torch::empty({batch_size}, input.options());\n\n    int block_size = 256;\n    if (num_pooled < block_size) {\n        // Adjust block size if num_pooled is small, but 256 is usually fine.\n    }\n    \n    dim3 grid(batch_size);\n    dim3 block(block_size);\n    int shared_mem_size = block_size * sizeof(float);\n\n    fused_ops_kernel<<<grid, block, shared_mem_size>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        batch_size,\n        out_features,\n        pool_kernel_size,\n        scale_factor,\n        num_pooled\n    );\n\n    return output;\n}\n\"\"\"\n\nfused_ops_lib = load_inline(\n    name=\"fused_ops_lib\",\n    cpp_sources=fused_ops_cpp_source,\n    functions=[\"fused_ops_hip\"],\n    verbose=True,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):\n        super(ModelNew, self).__init__()\n        self.matmul = nn.Linear(in_features, out_features)\n        self.pool_kernel_size = pool_kernel_size\n        self.scale_factor = scale_factor\n        self.fused_ops_lib = fused_ops_lib\n\n    def forward(self, x):\n        x = self.matmul(x)\n        return self.fused_ops_lib.fused_ops_hip(x, self.pool_kernel_size, self.scale_factor)\n",
+                    "path": "kernel.py"
+                  },
+                  "thought_signature": "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",
+                  "parse_error": null,
+                  "raw_arguments": null
+                }
+              ],
+              "provider": "google",
+              "api": "google-generative-ai",
+              "model": "gemini-3-flash-preview",
+              "tool_call_id": null,
+              "details": null,
+              "timestamp": null
+            },
+            "finish_reason": "stop",
+            "logprobs": null,
+            "stop_reason": null,
+            "token_ids": null
+          }
+        ],
+        "prompt_logprobs": null
+      },
+      {
+        "id": "google-1769031541",
+        "object": "chat.completion",
+        "created": 1769031541,
+        "model": "gemini-3-flash-preview",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        },
+        "kv_transfer_params": null,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "toolCall",
+                  "id": "bash_1769031541_1",
+                  "name": "bash",
+                  "arguments": {
+                    "command": "wafer evaluate kernelbench --target local-mi300x --implementation kernel.py --reference /root/Wafer/research/KernelBench/KernelBench/level2/98_Matmul_AvgPool_GELU_Scale_Max.py --benchmark --defensive\n"
+                  },
+                  "thought_signature": "EpkBCpYBAXLI2nxuLYt4MSX4b21m9o6ia8GjbgGvuQ7ggOe8l1l/mpvqE9d0SoPwMinWidRSA1w71F0w86+demxUwm+e2p/f0vsf6jX8as0d39dnLYXJgxJJVfTHREHc72s+CfwuXEwkBVx3BRawezPVVBFAMfXy3Kbo7NOyHw/elf7fxPa+afhEVAJoFMwxbwvd3a5iw3vH6Ap+",
+                  "parse_error": null,
+                  "raw_arguments": null
+                }
+              ],
+              "provider": "google",
+              "api": "google-generative-ai",
+              "model": "gemini-3-flash-preview",
+              "tool_call_id": null,
+              "details": null,
+              "timestamp": null
+            },
+            "finish_reason": "stop",
+            "logprobs": null,
+            "stop_reason": null,
+            "token_ids": null
+          }
+        ],
+        "prompt_logprobs": null
+      },
+      {
+        "id": "google-1769031977",
+        "object": "chat.completion",
+        "created": 1769031977,
+        "model": "gemini-3-flash-preview",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        },
+        "kv_transfer_params": null,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "toolCall",
+                  "id": "write_1769031977_1",
+                  "name": "write",
+                  "arguments": {
+                    "content": "\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nimport os\n\nos.environ[\"CXX\"] = \"hipcc\"\n\nfused_ops_cpp_source = \"\"\"\n#include <hip/hip_runtime.h>\n#include <torch/extension.h>\n#include <cmath>\n#include <algorithm>\n\n__device__ inline float gelu(float x) {\n    return 0.5f * x * (1.0f + erff(x * M_SQRT1_2));\n}\n\n__global__ void post_matmul_fused_kernel(\n    const float* __restrict__ input, // shape: (batch_size, num_pooled)\n    float* __restrict__ output,       // shape: (batch_size,)\n    int batch_size,\n    int num_pooled,\n    float scale_factor) {\n\n    int row = blockIdx.x;\n    if (row >= batch_size) return;\n\n    extern __shared__ float shared_data[];\n\n    float max_val = -1e20f;\n    for (int i = threadIdx.x; i < num_pooled; i += blockDim.x) {\n        float val = gelu(input[row * num_pooled + i]) * scale_factor;\n        if (val > max_val) max_val = val;\n    }\n\n    shared_data[threadIdx.x] = max_val;\n    __syncthreads();\n\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (threadIdx.x < stride) {\n            shared_data[threadIdx.x] = fmaxf(shared_data[threadIdx.x], shared_data[threadIdx.x + stride]);\n        }\n        __syncthreads();\n    }\n\n    if (threadIdx.x == 0) {\n        output[row] = shared_data[0];\n    }\n}\n\ntorch::Tensor post_matmul_fused_hip(torch::Tensor input, float scale_factor) {\n    int batch_size = input.size(0);\n    int num_pooled = input.size(1);\n    \n    auto output = torch::empty({batch_size}, input.options());\n\n    int block_size = 256;\n    dim3 grid(batch_size);\n    dim3 block(block_size);\n    int shared_mem_size = block_size * sizeof(float);\n\n    post_matmul_fused_kernel<<<grid, block, shared_mem_size>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        batch_size,\n        num_pooled,\n        scale_factor\n    );\n\n    return output;\n}\n\"\"\"\n\npost_matmul_fused_lib = load_inline(\n    name=\"post_matmul_fused_lib\",\n    cpp_sources=fused_ops_cpp_source,\n    functions=[\"post_matmul_fused_hip\"],\n    verbose=True,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):\n        super(ModelNew, self).__init__()\n        self.in_features = in_features\n        self.out_features = out_features\n        self.pool_kernel_size = pool_kernel_size\n        self.scale_factor = scale_factor\n        \n        # We still need the original Linear layer to match the original Model's parameters\n        self.matmul = nn.Linear(in_features, out_features)\n        self.post_matmul_fused_lib = post_matmul_fused_lib\n        \n        self.initialized = False\n        self.weight_pooled = None\n        self.bias_pooled = None\n\n    def _initialize_pooled_weights(self):\n        # pool the weights and bias\n        # weight shape is (out_features, in_features)\n        # bias shape is (out_features)\n        with torch.no_grad():\n            w = self.matmul.weight\n            b = self.matmul.bias\n            num_pooled = self.out_features // self.pool_kernel_size\n            \n            # W_pooled: (num_pooled, in_features)\n            self.weight_pooled = w[:num_pooled * self.pool_kernel_size, :].view(\n                num_pooled, self.pool_kernel_size, self.in_features\n            ).mean(dim=1)\n            \n            if b is not None:\n                self.bias_pooled = b[:num_pooled * self.pool_kernel_size].view(\n                    num_pooled, self.pool_kernel_size\n                ).mean(dim=1)\n            else:\n                self.bias_pooled = None\n        self.initialized = True\n\n    def forward(self, x):\n        if not self.initialized:\n            self._initialize_pooled_weights()\n        \n        # New matmul: (batch_size, in_features) @ (in_features, num_pooled)\n        # weight_pooled is (num_pooled, in_features), so we transpose it.\n        x = torch.matmul(x, self.weight_pooled.t())\n        if self.bias_pooled is not None:\n            x = x + self.bias_pooled\n            \n        return self.post_matmul_fused_lib.post_matmul_fused_hip(x, self.scale_factor)\n",
+                    "path": "kernel.py"
+                  },
+                  "thought_signature": "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",
+                  "parse_error": null,
+                  "raw_arguments": null
+                }
+              ],
+              "provider": "google",
+              "api": "google-generative-ai",
+              "model": "gemini-3-flash-preview",
+              "tool_call_id": null,
+              "details": null,
+              "timestamp": null
+            },
+            "finish_reason": "stop",
+            "logprobs": null,
+            "stop_reason": null,
+            "token_ids": null
+          }
+        ],
+        "prompt_logprobs": null
+      },
+      {
+        "id": "google-1769031979",
+        "object": "chat.completion",
+        "created": 1769031979,
+        "model": "gemini-3-flash-preview",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        },
+        "kv_transfer_params": null,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "toolCall",
+                  "id": "bash_1769031979_1",
+                  "name": "bash",
+                  "arguments": {
+                    "command": "wafer evaluate kernelbench --target local-mi300x --implementation kernel.py --reference /root/Wafer/research/KernelBench/KernelBench/level2/98_Matmul_AvgPool_GELU_Scale_Max.py --benchmark --defensive\n"
+                  },
+                  "thought_signature": "Eo8GCowGAXLI2nyhRoDSHbXaRs/RtOA4LFu5XOjYE2J7h8LNEfwQNo10KicHlPA4BdzdLjEJGxvoMjN7nBe9pCiQIvGVO3WEf6S6X+k4V2PuZglRzbUiurnXZcyMrM5AGPSxx+V0YvaxGMgJZ5LtMk8F16h8wAd0ciG68R7G1JgRoSd2oagjhI3I+Bs2gF09EQarx9IqeXF5urgiP1iSI2ik/P27Xp4045QJ5S5A9LBCWetRHpFYCAjZlF1gBRbaxWbn+9euD/Xr4AW/Of7jr1Jwg899BeuLK4ydZ9LuwTy1wAOjh0nq/di57XQhujwF/OaZyySYII25PevoUYoC4NJMcr3VaS9mopPrzX2stREaRaiuIwNP6FNrI8UZ/ZAgBbOIRFKPbNpaHMZWywsXu0qG+GuN9+XuamTEIWuhMDuC99cBDBaazu8V2Hnl16EiWon9WnLun+pV6PeH/czUOMALICBz0kcrCUrztuFvAcG9hWwhl8rSlZ1MW3m84m5luOWwk6wWfg2qw5idrMw8AsbEPxqUH2gAhy/Iqgugqq0alTQ7O30zUpNWLPwPayF8Be3QDrsBRXLnCktiIXpPfE5dSNyVlHxOt3OuA10sGrh3+9/dCvI/8kIxbzR0ZOtD5gIGDKvsqg5tYpLVIJ2ouNK2ekr+ceNI5TzznunHJXotjAUSwE3Uo8e2yPk0KgUTjIiTuJ8sbuOWu0bQTyNLOmUa920BaQTuF5QrVnkyNcrP17iGexitEsY2O2rhHGq4aiDAtsldaEVbGw+8+IgQ1AJOzHC4XrPqnm3CNEx4LrzTSwRn/t+uMwkl8asHTtORIG3nFJWPTDq9RfR/G81t3n7KxIK+jdLRyNvyDFnYN0dwS1e55qLHNlE4gUf2bKK5pmOtZTRjScSMlsPMyXezZZONf/5itiY8i82sN4Hrc+Jw7bcCknHXw+xYXdl4f83gpViP8KFxgruErjaFJ+3ILkgPMUYZkDxtab7xXm9x9NJA2HInyYyItvQfQw84KHfrj9F625ZtAesibgtJ/n7dZk0E",
+                  "parse_error": null,
+                  "raw_arguments": null
+                }
+              ],
+              "provider": "google",
+              "api": "google-generative-ai",
+              "model": "gemini-3-flash-preview",
+              "tool_call_id": null,
+              "details": null,
+              "timestamp": null
+            },
+            "finish_reason": "stop",
+            "logprobs": null,
+            "stop_reason": null,
+            "token_ids": null
+          }
+        ],
+        "prompt_logprobs": null
+      },
+      {
+        "id": "google-1769032037",
+        "object": "chat.completion",
+        "created": 1769032037,
+        "model": "gemini-3-flash-preview",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        },
+        "kv_transfer_params": null,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "toolCall",
+                  "id": "write_1769032037_1",
+                  "name": "write",
+                  "arguments": {
+                    "content": "\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nimport os\n\nos.environ[\"CXX\"] = \"hipcc\"\n\nfused_ops_cpp_source = \"\"\"\n#include <hip/hip_runtime.h>\n#include <torch/extension.h>\n#include <cmath>\n#include <algorithm>\n\n__device__ inline float gelu(float x) {\n    return 0.5f * x * (1.0f + erff(x * M_SQRT1_2));\n}\n\n__global__ void post_matmul_fused_kernel(\n    const float* __restrict__ input, // shape: (batch_size, num_pooled)\n    float* __restrict__ output,       // shape: (batch_size,)\n    int batch_size,\n    int num_pooled,\n    float scale_factor) {\n\n    int row = blockIdx.x;\n    if (row >= batch_size) return;\n\n    extern __shared__ float shared_data[];\n\n    float max_val = -1e20f;\n    for (int i = threadIdx.x; i < num_pooled; i += blockDim.x) {\n        float val = gelu(input[row * num_pooled + i]) * scale_factor;\n        if (val > max_val) max_val = val;\n    }\n\n    shared_data[threadIdx.x] = max_val;\n    __syncthreads();\n\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (threadIdx.x < stride) {\n            shared_data[threadIdx.x] = fmaxf(shared_data[threadIdx.x], shared_data[threadIdx.x + stride]);\n        }\n        __syncthreads();\n    }\n\n    if (threadIdx.x == 0) {\n        output[row] = shared_data[0];\n    }\n}\n\ntorch::Tensor post_matmul_fused_hip(torch::Tensor input, float scale_factor) {\n    int batch_size = input.size(0);\n    int num_pooled = input.size(1);\n    \n    auto output = torch::empty({batch_size}, input.options());\n\n    int block_size = 256;\n    dim3 grid(batch_size);\n    dim3 block(block_size);\n    int shared_mem_size = block_size * sizeof(float);\n\n    post_matmul_fused_kernel<<<grid, block, shared_mem_size>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        batch_size,\n        num_pooled,\n        scale_factor\n    );\n\n    return output;\n}\n\"\"\"\n\npost_matmul_fused_lib = load_inline(\n    name=\"post_matmul_fused_lib\",\n    cpp_sources=fused_ops_cpp_source,\n    functions=[\"post_matmul_fused_hip\"],\n    verbose=True,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):\n        super(ModelNew, self).__init__()\n        self.in_features = in_features\n        self.out_features = out_features\n        self.pool_kernel_size = pool_kernel_size\n        self.scale_factor = float(scale_factor)\n        \n        self.matmul = nn.Linear(in_features, out_features)\n        self.post_matmul_fused_lib = post_matmul_fused_lib\n        \n        # We'll use these to cache the pooled weight/bias\n        self.register_buffer('weight_pooled', None)\n        self.register_buffer('bias_pooled', None)\n\n    def _initialize_pooled_weights(self):\n        # pool the weights and bias\n        with torch.no_grad():\n            w = self.matmul.weight\n            b = self.matmul.bias\n            num_pooled = self.out_features // self.pool_kernel_size\n            \n            # W_pooled: (num_pooled, in_features)\n            wp = w[:num_pooled * self.pool_kernel_size, :].view(\n                num_pooled, self.pool_kernel_size, self.in_features\n            ).mean(dim=1)\n            self.weight_pooled = wp\n            \n            if b is not None:\n                bp = b[:num_pooled * self.pool_kernel_size].view(\n                    num_pooled, self.pool_kernel_size\n                ).mean(dim=1)\n                self.bias_pooled = bp\n            else:\n                self.bias_pooled = None\n\n    def forward(self, x):\n        if self.weight_pooled is None:\n            self._initialize_pooled_weights()\n        \n        # New matmul: (batch_size, in_features) @ (in_features, num_pooled)\n        # weight_pooled is (num_pooled, in_features), so we transpose it.\n        # Ensure x and weights are on the same device and use same dtype\n        x = torch.matmul(x, self.weight_pooled.t())\n        if self.bias_pooled is not None:\n            x = x + self.bias_pooled\n            \n        return self.post_matmul_fused_lib.post_matmul_fused_hip(x, self.scale_factor)\n",
+                    "path": "kernel.py"
+                  },
+                  "thought_signature": "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",
+                  "parse_error": null,
+                  "raw_arguments": null
+                }
+              ],
+              "provider": "google",
+              "api": "google-generative-ai",
+              "model": "gemini-3-flash-preview",
+              "tool_call_id": null,
+              "details": null,
+              "timestamp": null
+            },
+            "finish_reason": "stop",
+            "logprobs": null,
+            "stop_reason": null,
+            "token_ids": null
+          }
+        ],
+        "prompt_logprobs": null
+      },
+      {
+        "id": "google-1769032039",
+        "object": "chat.completion",
+        "created": 1769032039,
+        "model": "gemini-3-flash-preview",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        },
+        "kv_transfer_params": null,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "toolCall",
+                  "id": "bash_1769032039_1",
+                  "name": "bash",
+                  "arguments": {
+                    "command": "wafer evaluate kernelbench --target local-mi300x --implementation kernel.py --reference /root/Wafer/research/KernelBench/KernelBench/level2/98_Matmul_AvgPool_GELU_Scale_Max.py --benchmark --defensive\n"
+                  },
+                  "thought_signature": "EpMBCpABAXLI2nzwV6DhiV5wGAEI2OUyD2ZHkiRgCcrMy8+i0lMbYM67zjRb7l7/EmWbl/Unywf8xIWkg8CLCdDNOwvLpcI2kjZj60/db54QDOAwhYjnRoqbub6Y08d8U47WB7fs5ONEi/7a0HTDwW04KYZf+hUwXyvNa5ViN0l0FVzlf4d6YtwgEVqBs5rhUM7KhQ/Y",
+                  "parse_error": null,
+                  "raw_arguments": null
+                }
+              ],
+              "provider": "google",
+              "api": "google-generative-ai",
+              "model": "gemini-3-flash-preview",
+              "tool_call_id": null,
+              "details": null,
+              "timestamp": null
+            },
+            "finish_reason": "stop",
+            "logprobs": null,
+            "stop_reason": null,
+            "token_ids": null
+          }
+        ],
+        "prompt_logprobs": null
+      },
+      {
+        "id": "google-1769032122",
+        "object": "chat.completion",
+        "created": 1769032122,
+        "model": "gemini-3-flash-preview",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        },
+        "kv_transfer_params": null,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "DONE",
+                  "text_signature": null
+                }
+              ],
+              "provider": "google",
+              "api": "google-generative-ai",
+              "model": "gemini-3-flash-preview",
+              "tool_call_id": null,
+              "details": null,
+              "timestamp": null
+            },
+            "finish_reason": "stop",
+            "logprobs": null,
+            "stop_reason": null,
+            "token_ids": null
+          }
+        ],
+        "prompt_logprobs": null
+      },
+      {
+        "id": "google-1769032124",
+        "object": "chat.completion",
+        "created": 1769032124,
+        "model": "gemini-3-flash-preview",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        },
+        "kv_transfer_params": null,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "\nDONE",
+                  "text_signature": null
+                }
+              ],
+              "provider": "google",
+              "api": "google-generative-ai",
+              "model": "gemini-3-flash-preview",
+              "tool_call_id": null,
+              "details": null,
+              "timestamp": null
+            },
+            "finish_reason": "stop",
+            "logprobs": null,
+            "stop_reason": null,
+            "token_ids": null
+          }
+        ],
+        "prompt_logprobs": null
+      },
+      {
+        "id": "google-1769032126",
+        "object": "chat.completion",
+        "created": 1769032126,
+        "model": "gemini-3-flash-preview",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        },
+        "kv_transfer_params": null,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": [],
+              "provider": "google",
+              "api": "google-generative-ai",
+              "model": "gemini-3-flash-preview",
+              "tool_call_id": null,
+              "details": null,
+              "timestamp": null
+            },
+            "finish_reason": "stop",
+            "logprobs": null,
+            "stop_reason": null,
+            "token_ids": null
+          }
+        ],
+        "prompt_logprobs": null
+      },
+      {
+        "id": "google-1769032127",
+        "object": "chat.completion",
+        "created": 1769032127,
+        "model": "gemini-3-flash-preview",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        },
+        "kv_transfer_params": null,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": [],
+              "provider": "google",
+              "api": "google-generative-ai",
+              "model": "gemini-3-flash-preview",
+              "tool_call_id": null,
+              "details": null,
+              "timestamp": null
+            },
+            "finish_reason": "stop",
+            "logprobs": null,
+            "stop_reason": null,
+            "token_ids": null
+          }
+        ],
+        "prompt_logprobs": null
+      },
+      {
+        "id": "google-1769032129",
+        "object": "chat.completion",
+        "created": 1769032129,
+        "model": "gemini-3-flash-preview",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        },
+        "kv_transfer_params": null,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": [],
+              "provider": "google",
+              "api": "google-generative-ai",
+              "model": "gemini-3-flash-preview",
+              "tool_call_id": null,
+              "details": null,
+              "timestamp": null
+            },
+            "finish_reason": "stop",
+            "logprobs": null,
+            "stop_reason": null,
+            "token_ids": null
+          }
+        ],
+        "prompt_logprobs": null
+      },
+      {
+        "id": "google-1769032137",
+        "object": "chat.completion",
+        "created": 1769032137,
+        "model": "gemini-3-flash-preview",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        },
+        "kv_transfer_params": null,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nimport os\n\nos.environ[\"CXX\"] = \"hipcc\"\n\nfused_ops_cpp_source = \"\"\"\n#include <hip/hip_runtime.h>\n#include <torch/extension.h>\n#include <cmath>\n#include <algorithm>\n\n__device__ inline float gelu(float x) {\n    return 0.5f * x * (1.0f + erff(x * M_SQRT1_2));\n}\n\n__global__ void post_matmul_fused_kernel(\n    const float* __restrict__ input, // shape: (batch_size, num_pooled)\n    float* __restrict__ output,       // shape: (batch_size,)\n    int batch_size,\n    int num_pooled,\n    float scale_factor) {\n\n    int row = blockIdx.x;\n    if (row >= batch_size) return;\n\n    extern __shared__ float shared_data[];\n\n    float max_val = -1e20f;\n    for (int i = threadIdx.x; i < num_pooled; i += blockDim.x) {\n        float val = gelu(input[row * num_pooled + i]) * scale_factor;\n        if (val > max_val) max_val = val;\n    }\n\n    shared_data[threadIdx.x] = max_val;\n    __syncthreads();\n\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (threadIdx.x < stride) {\n            shared_data[threadIdx.x] = fmaxf(shared_data[threadIdx.x], shared_data[threadIdx.x + stride]);\n        }\n        __syncthreads();\n    }\n\n    if (threadIdx.x == 0) {\n        output[row] = shared_data[0];\n    }\n}\n\ntorch::Tensor post_matmul_fused_hip(torch::Tensor input, float scale_factor) {\n    int batch_size = input.size(0);\n    int num_pooled = input.size(1);\n    \n    auto output = torch::empty({batch_size}, input.options());\n\n    int block_size = 256;\n    dim3 grid(batch_size);\n    dim3 block(block_size);\n    int shared_mem_size = block_size * sizeof(float);\n\n    post_matmul_fused_kernel<<<grid, block, shared_mem_size>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        batch_size,\n        num_pooled,\n        scale_factor\n    );\n\n    return output;\n}\n\"\"\"\n\npost_matmul_fused_lib = load_inline(\n    name=\"post_matmul_fused_lib\",\n    cpp_sources=fused_ops_cpp_source,\n    functions=[\"post_matmul_fused_hip\"],\n    verbose=True,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):\n        super(ModelNew, self).__init__()\n        self.in_features = in_features\n        self.out_features = out_features\n        self.pool_kernel_size = pool_kernel_size\n        self.scale_factor = float(scale_factor)\n        \n        self.matmul = nn.Linear(in_features, out_features)\n        self.post_matmul_fused_lib = post_matmul_fused_lib\n        \n        self.register_buffer('weight_pooled', None)\n        self.register_buffer('bias_pooled', None)\n\n    def _initialize_pooled_weights(self):\n        with torch.no_grad():\n            w = self.matmul.weight\n            b = self.matmul.bias\n            num_pooled = self.out_features // self.pool_kernel_size\n            \n            wp = w[:num_pooled * self.pool_kernel_size, :].view(\n                num_pooled, self.pool_kernel_size, self.in_features\n            ).mean(dim=1)\n            self.weight_pooled = wp\n            \n            if b is not None:\n                bp = b[:num_pooled * self.pool_kernel_size].view(\n                    num_pooled, self.pool_kernel_size\n                ).mean(dim=1)\n                self.bias_pooled = bp\n            else:\n                self.bias_pooled = None\n\n    def forward(self, x):\n        if self.weight_pooled is None:\n            self._initialize_pooled_weights()\n        \n        x = torch.matmul(x, self.weight_pooled.t())\n        if self.bias_pooled is not None:\n            x = x + self.bias_pooled\n            \n        return self.post_matmul_fused_lib.post_matmul_fused_hip(x, self.scale_factor)\n\nDONE",
+                  "text_signature": null
+                }
+              ],
+              "provider": "google",
+              "api": "google-generative-ai",
+              "model": "gemini-3-flash-preview",
+              "tool_call_id": null,
+              "details": null,
+              "timestamp": null
+            },
+            "finish_reason": "stop",
+            "logprobs": null,
+            "stop_reason": null,
+            "token_ids": null
+          }
+        ],
+        "prompt_logprobs": null
+      }
+    ],
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a GPU AMD HIP kernel optimization expert. Your task is to optimize GPU kernels for performance.\n\nCRITICAL: You do NOT have a local GPU. You MUST use `wafer evaluate kernelbench` to test kernels on remote GPU hardware. Do not try to run kernels locally with Python - it will fail.\n\n## Kernel Format\n\nKernels use PyTorch's load_inline to compile HIP code. The format is:\n- `custom_kernel(inputs)` - Your kernel function that takes a tuple of tensors\n- The HIP code is embedded as a string and compiled with load_inline\n\n## Tools Available\n- bash(command): Run shell commands including wafer CLI\n- write(file_path, content): Write optimized kernel\n\n## MANDATORY Workflow - Follow These Steps EXACTLY\n\n1. Understand the naive kernel (reference implementation provided in prompt)\n2. Identify bottlenecks (memory access patterns, lack of tiling, etc.)\n3. Use the write tool to create your optimized kernel file with `custom_kernel(inputs)` function\n4. IMMEDIATELY run wafer evaluate with a 300-second timeout (needed for remote GPU execution):\n   `bash(command=\"wafer evaluate kernelbench --target <target> --implementation <your_kernel.py> --reference <ref.py> --benchmark\", timeout=300)`\n5. Read the FULL output from wafer evaluate carefully:\n   - If you see compilation errors: Fix the HIP syntax and go back to step 3\n   - If you see runtime errors: Fix the kernel logic and go back to step 3\n   - If correctness tests FAIL: Debug the kernel correctness and go back to step 3\n   - If correctness tests PASS but speedup is poor: Optimize further and go back to step 3\n   - If correctness tests PASS and speedup is good: Say \"DONE\" to complete the task\n6. KEEP TRYING - Most kernels need 2-3 iterations to get right. Don't give up after one error.\n7. Only say \"DONE\" after wafer evaluate shows PASSING correctness tests\n\n## CRITICAL RULES\n\n- NEVER skip step 4 - you MUST run wafer evaluate kernelbench after writing ANY kernel\n- NEVER give up after one error - read the error message, fix the problem, and try again\n- NEVER say \"DONE\" without seeing \"PASS\" in the wafer evaluate output\n- Your score will be 0 if you don't run wafer evaluate kernelbench, regardless of code quality\n- Your score will be 0 if the kernel doesn't pass correctness tests, regardless of speedup\n- Running wafer evaluate is the ONLY way to verify your kernel works correctly on real GPU hardware\n\nGPU Target: local-mi300x\n\nExample test command:\n```\nwafer evaluate kernelbench --target local-mi300x --implementation my_optimized.py --reference reference.py --benchmark --defensive\n```",
+        "provider": null,
+        "api": null,
+        "model": null,
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "user",
+        "content": "You write custom HIP/ROCm kernels to replace the pytorch operators in the given architecture to get speedups.\n\nYou have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom HIP/ROCm kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.\n\nHere's an example to show you the syntax of inline embedding custom HIP/ROCm kernels in PyTorch:\n\nExample:\n\nInput architecture:\n\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\n\nclass Model(nn.Module):\n    def __init__(self) -> None:\n        super().__init__()\n\n    def forward(self, a, b):\n        return a + b\n\n\ndef get_inputs():\n    # randomly generate input tensors based on the model architecture\n    a = torch.randn(1, 128).cuda()\n    b = torch.randn(1, 128).cuda()\n    return [a, b]\n\n\ndef get_init_inputs():\n    # randomly generate tensors required for initialization based on the model architecture\n    return []\n\n\nOptimized with HIP/ROCm kernels:\n\nimport os\n\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\nos.environ[\"CXX\"] = \"hipcc\"\n\nelementwise_add_cpp_source = \"\"\"\n#include <hip/hip_runtime.h>\n\n__global__ void elementwise_add_kernel(const float* a, const float* b, float* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        out[idx] = a[idx] + b[idx];\n    }\n}\n\ntorch::Tensor elementwise_add_hip(torch::Tensor a, torch::Tensor b) {\n    auto size = a.numel();\n    auto out = torch::zeros_like(a);\n\n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n\n    elementwise_add_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);\n\n    return out;\n}\n\"\"\"\n\nelementwise_add = load_inline(\n    name=\"elementwise_add\",\n    cpp_sources=elementwise_add_cpp_source,\n    functions=[\"elementwise_add_hip\"],\n    verbose=True,\n)\n\n\nclass ModelNew(nn.Module):\n    def __init__(self) -> None:\n        super().__init__()\n        self.elementwise_add = elementwise_add\n\n    def forward(self, a, b):\n        return self.elementwise_add.elementwise_add_hip(a, b)\n\nYou are given the following architecture:\n\n\nimport torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    \"\"\"\n    A model implementing the pattern \"Matmul_AvgPool_GELU_Scale_Max\".\n    \"\"\"\n    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):\n        super(Model, self).__init__()\n        self.matmul = nn.Linear(in_features, out_features)\n        self.avg_pool = nn.AvgPool1d(kernel_size=pool_kernel_size)\n        self.scale_factor = scale_factor\n\n    def forward(self, x):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, in_features).\n\n        Returns:\n            torch.Tensor: Output tensor of shape (batch_size, out_features).\n        \"\"\"\n        x = self.matmul(x)\n        x = self.avg_pool(x.unsqueeze(1)).squeeze(1)\n        x = torch.nn.functional.gelu(x)\n        x = x * self.scale_factor\n        x = torch.max(x, dim=1).values\n        return x\n\nbatch_size = 1024\nin_features = 8192\nout_features = 8192\npool_kernel_size = 16\nscale_factor = 2.0\n\ndef get_inputs():\n    return [torch.rand(batch_size, in_features)]\n\ndef get_init_inputs():\n    return [in_features, out_features, pool_kernel_size, scale_factor]\n\nNote: The kernels should be optimized for FP32 (32-bit floating point) precision.\n\nOptimize the architecture named Model with custom HIP/ROCm kernels! Name your optimized output architecture ModelNew.\n\nFollow the workflow in the system prompt:\n1. Use the write tool to create your optimized kernel file\n2. Test it with the wafer evaluate kernelbench command\n3. Iterate based on results until you achieve correctness and performance improvements\n\n\n## MANDATORY: Testing Your Implementation\n\nAfter writing your optimized HIP kernel, you MUST IMMEDIATELY test it by running this exact command:\n```bash\nwafer evaluate kernelbench --target local-mi300x --implementation <your_kernel.py> --reference /root/Wafer/research/KernelBench/KernelBench/level2/98_Matmul_AvgPool_GELU_Scale_Max.py --benchmark --defensive\n```\n\nThe reference implementation path is: `/root/Wafer/research/KernelBench/KernelBench/level2/98_Matmul_AvgPool_GELU_Scale_Max.py`\n\nIMPORTANT: The --defensive flag is REQUIRED to prevent timing exploits.\n\n## What to do next:\n\n1. Write your optimized kernel to a .py file\n2. IMMEDIATELY run the wafer evaluate command above with --defensive (do NOT skip this step)\n3. Read the output to see if correctness tests pass\n4. If tests fail: Fix the kernel and test again\n5. If tests pass: Check the speedup and say \"DONE\"\n\nRemember: Your score is 0 if you don't run wafer evaluate kernelbench. This is NOT optional.",
+        "provider": null,
+        "api": null,
+        "model": null,
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "write_1769031540_1",
+            "name": "write",
+            "arguments": {
+              "content": "\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nimport os\n\nos.environ[\"CXX\"] = \"hipcc\"\n\nfused_ops_cpp_source = \"\"\"\n#include <hip/hip_runtime.h>\n#include <torch/extension.h>\n#include <cmath>\n#include <algorithm>\n\n__device__ inline float gelu(float x) {\n    return 0.5f * x * (1.0f + erff(x * M_SQRT1_2));\n}\n\n__global__ void fused_ops_kernel(\n    const float* __restrict__ input,\n    float* __restrict__ output,\n    int batch_size,\n    int out_features,\n    int pool_kernel_size,\n    float scale_factor,\n    int num_pooled) {\n\n    int row = blockIdx.x;\n    if (row >= batch_size) return;\n\n    extern __shared__ float shared_data[];\n\n    float max_val = -1e20f;\n    \n    // Each thread calculates one or more pooled values\n    for (int i = threadIdx.x; i < num_pooled; i += blockDim.x) {\n        float sum = 0.0f;\n        int start_idx = i * pool_kernel_size;\n        for (int k = 0; k < pool_kernel_size; ++k) {\n            sum += input[row * out_features + start_idx + k];\n        }\n        float avg = sum / (float)pool_kernel_size;\n        float val = gelu(avg) * scale_factor;\n        if (val > max_val) max_val = val;\n    }\n\n    // Now reduce max_val within the block\n    shared_data[threadIdx.x] = max_val;\n    __syncthreads();\n\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (threadIdx.x < stride) {\n            shared_data[threadIdx.x] = fmaxf(shared_data[threadIdx.x], shared_data[threadIdx.x + stride]);\n        }\n        __syncthreads();\n    }\n\n    if (threadIdx.x == 0) {\n        output[row] = shared_data[0];\n    }\n}\n\ntorch::Tensor fused_ops_hip(torch::Tensor input, int pool_kernel_size, float scale_factor) {\n    int batch_size = input.size(0);\n    int out_features = input.size(1);\n    int num_pooled = out_features / pool_kernel_size;\n    \n    auto output = torch::empty({batch_size}, input.options());\n\n    int block_size = 256;\n    if (num_pooled < block_size) {\n        // Adjust block size if num_pooled is small, but 256 is usually fine.\n    }\n    \n    dim3 grid(batch_size);\n    dim3 block(block_size);\n    int shared_mem_size = block_size * sizeof(float);\n\n    fused_ops_kernel<<<grid, block, shared_mem_size>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        batch_size,\n        out_features,\n        pool_kernel_size,\n        scale_factor,\n        num_pooled\n    );\n\n    return output;\n}\n\"\"\"\n\nfused_ops_lib = load_inline(\n    name=\"fused_ops_lib\",\n    cpp_sources=fused_ops_cpp_source,\n    functions=[\"fused_ops_hip\"],\n    verbose=True,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):\n        super(ModelNew, self).__init__()\n        self.matmul = nn.Linear(in_features, out_features)\n        self.pool_kernel_size = pool_kernel_size\n        self.scale_factor = scale_factor\n        self.fused_ops_lib = fused_ops_lib\n\n    def forward(self, x):\n        x = self.matmul(x)\n        return self.fused_ops_lib.fused_ops_hip(x, self.pool_kernel_size, self.scale_factor)\n",
+              "path": "kernel.py"
+            },
+            "thought_signature": "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",
+            "parse_error": null,
+            "raw_arguments": null
+          }
+        ],
+        "provider": "google",
+        "api": "google-generative-ai",
+        "model": "gemini-3-flash-preview",
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "tool",
+        "content": "Successfully wrote 3050 bytes to kernel.py",
+        "provider": null,
+        "api": null,
+        "model": null,
+        "tool_call_id": "write_1769031540_1",
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "bash_1769031541_1",
+            "name": "bash",
+            "arguments": {
+              "command": "wafer evaluate kernelbench --target local-mi300x --implementation kernel.py --reference /root/Wafer/research/KernelBench/KernelBench/level2/98_Matmul_AvgPool_GELU_Scale_Max.py --benchmark --defensive\n"
+            },
+            "thought_signature": "EpkBCpYBAXLI2nxuLYt4MSX4b21m9o6ia8GjbgGvuQ7ggOe8l1l/mpvqE9d0SoPwMinWidRSA1w71F0w86+demxUwm+e2p/f0vsf6jX8as0d39dnLYXJgxJJVfTHREHc72s+CfwuXEwkBVx3BRawezPVVBFAMfXy3Kbo7NOyHw/elf7fxPa+afhEVAJoFMwxbwvd3a5iw3vH6Ap+",
+            "parse_error": null,
+            "raw_arguments": null
+          }
+        ],
+        "provider": "google",
+        "api": "google-generative-ai",
+        "model": "gemini-3-flash-preview",
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "tool",
+        "content": "Using target: local-mi300x\nConnecting to root@localhost:22...\nCreated run directory: /root/.wafer/workspaces/kernelbench/kernelbench_eval_20260121_214514\nRunning KernelBench evaluation in Docker container...\nDocker command: docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -v /root/.wafer/workspaces/ker...\nRequirement already satisfied: uv in /opt/venv/lib/python3.12/site-packages (0.9.26)\n[1/2] hipcc -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=fused_ops_lib -DTORCH_API_INCLUDE_EXTENSION_H -isystem /opt/venv/lib/python3.12/site-packages/torch/include -isystem /opt/venv/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /usr/include/python3.12 -fPIC -std=c++17 -c /root/.cache/torch_extensions/py312_cpu/fused_ops_lib/main.cpp -o main.o -D__HIP_PLATFORM_AMD__=1 -DUSE_ROCM=1 -DHIPBLAS_V2 -fPIC\n[2/2] hipcc main.o -shared -L/opt/venv/lib/python3.12/site-packages/torch/lib -lc10 -ltorch_cpu -ltorch -ltorch_python -o fused_ops_lib.so\n[KernelBench] Modules loaded successfully\n[KernelBench] Models instantiated (seed=42)\n[KernelBench] Correctness: True\n[KernelBench] Running benchmarks...\n[KernelBench] New: 1.259ms, Ref: 1.235ms, Speedup: 0.98x\n[KernelBench] Results written to /workspace/kernelbench_eval_20260121_214514/results.json\n\n============================================================\nResult: PASS\nCorrectness: 1/1 (100.0%)\nSpeedup: 0.98x\n============================================================\n",
+        "provider": null,
+        "api": null,
+        "model": null,
+        "tool_call_id": "bash_1769031541_1",
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "write_1769031977_1",
+            "name": "write",
+            "arguments": {
+              "content": "\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nimport os\n\nos.environ[\"CXX\"] = \"hipcc\"\n\nfused_ops_cpp_source = \"\"\"\n#include <hip/hip_runtime.h>\n#include <torch/extension.h>\n#include <cmath>\n#include <algorithm>\n\n__device__ inline float gelu(float x) {\n    return 0.5f * x * (1.0f + erff(x * M_SQRT1_2));\n}\n\n__global__ void post_matmul_fused_kernel(\n    const float* __restrict__ input, // shape: (batch_size, num_pooled)\n    float* __restrict__ output,       // shape: (batch_size,)\n    int batch_size,\n    int num_pooled,\n    float scale_factor) {\n\n    int row = blockIdx.x;\n    if (row >= batch_size) return;\n\n    extern __shared__ float shared_data[];\n\n    float max_val = -1e20f;\n    for (int i = threadIdx.x; i < num_pooled; i += blockDim.x) {\n        float val = gelu(input[row * num_pooled + i]) * scale_factor;\n        if (val > max_val) max_val = val;\n    }\n\n    shared_data[threadIdx.x] = max_val;\n    __syncthreads();\n\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (threadIdx.x < stride) {\n            shared_data[threadIdx.x] = fmaxf(shared_data[threadIdx.x], shared_data[threadIdx.x + stride]);\n        }\n        __syncthreads();\n    }\n\n    if (threadIdx.x == 0) {\n        output[row] = shared_data[0];\n    }\n}\n\ntorch::Tensor post_matmul_fused_hip(torch::Tensor input, float scale_factor) {\n    int batch_size = input.size(0);\n    int num_pooled = input.size(1);\n    \n    auto output = torch::empty({batch_size}, input.options());\n\n    int block_size = 256;\n    dim3 grid(batch_size);\n    dim3 block(block_size);\n    int shared_mem_size = block_size * sizeof(float);\n\n    post_matmul_fused_kernel<<<grid, block, shared_mem_size>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        batch_size,\n        num_pooled,\n        scale_factor\n    );\n\n    return output;\n}\n\"\"\"\n\npost_matmul_fused_lib = load_inline(\n    name=\"post_matmul_fused_lib\",\n    cpp_sources=fused_ops_cpp_source,\n    functions=[\"post_matmul_fused_hip\"],\n    verbose=True,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):\n        super(ModelNew, self).__init__()\n        self.in_features = in_features\n        self.out_features = out_features\n        self.pool_kernel_size = pool_kernel_size\n        self.scale_factor = scale_factor\n        \n        # We still need the original Linear layer to match the original Model's parameters\n        self.matmul = nn.Linear(in_features, out_features)\n        self.post_matmul_fused_lib = post_matmul_fused_lib\n        \n        self.initialized = False\n        self.weight_pooled = None\n        self.bias_pooled = None\n\n    def _initialize_pooled_weights(self):\n        # pool the weights and bias\n        # weight shape is (out_features, in_features)\n        # bias shape is (out_features)\n        with torch.no_grad():\n            w = self.matmul.weight\n            b = self.matmul.bias\n            num_pooled = self.out_features // self.pool_kernel_size\n            \n            # W_pooled: (num_pooled, in_features)\n            self.weight_pooled = w[:num_pooled * self.pool_kernel_size, :].view(\n                num_pooled, self.pool_kernel_size, self.in_features\n            ).mean(dim=1)\n            \n            if b is not None:\n                self.bias_pooled = b[:num_pooled * self.pool_kernel_size].view(\n                    num_pooled, self.pool_kernel_size\n                ).mean(dim=1)\n            else:\n                self.bias_pooled = None\n        self.initialized = True\n\n    def forward(self, x):\n        if not self.initialized:\n            self._initialize_pooled_weights()\n        \n        # New matmul: (batch_size, in_features) @ (in_features, num_pooled)\n        # weight_pooled is (num_pooled, in_features), so we transpose it.\n        x = torch.matmul(x, self.weight_pooled.t())\n        if self.bias_pooled is not None:\n            x = x + self.bias_pooled\n            \n        return self.post_matmul_fused_lib.post_matmul_fused_hip(x, self.scale_factor)\n",
+              "path": "kernel.py"
+            },
+            "thought_signature": "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",
+            "parse_error": null,
+            "raw_arguments": null
+          }
+        ],
+        "provider": "google",
+        "api": "google-generative-ai",
+        "model": "gemini-3-flash-preview",
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "tool",
+        "content": "Successfully wrote 4061 bytes to kernel.py",
+        "provider": null,
+        "api": null,
+        "model": null,
+        "tool_call_id": "write_1769031977_1",
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "bash_1769031979_1",
+            "name": "bash",
+            "arguments": {
+              "command": "wafer evaluate kernelbench --target local-mi300x --implementation kernel.py --reference /root/Wafer/research/KernelBench/KernelBench/level2/98_Matmul_AvgPool_GELU_Scale_Max.py --benchmark --defensive\n"
+            },
+            "thought_signature": "Eo8GCowGAXLI2nyhRoDSHbXaRs/RtOA4LFu5XOjYE2J7h8LNEfwQNo10KicHlPA4BdzdLjEJGxvoMjN7nBe9pCiQIvGVO3WEf6S6X+k4V2PuZglRzbUiurnXZcyMrM5AGPSxx+V0YvaxGMgJZ5LtMk8F16h8wAd0ciG68R7G1JgRoSd2oagjhI3I+Bs2gF09EQarx9IqeXF5urgiP1iSI2ik/P27Xp4045QJ5S5A9LBCWetRHpFYCAjZlF1gBRbaxWbn+9euD/Xr4AW/Of7jr1Jwg899BeuLK4ydZ9LuwTy1wAOjh0nq/di57XQhujwF/OaZyySYII25PevoUYoC4NJMcr3VaS9mopPrzX2stREaRaiuIwNP6FNrI8UZ/ZAgBbOIRFKPbNpaHMZWywsXu0qG+GuN9+XuamTEIWuhMDuC99cBDBaazu8V2Hnl16EiWon9WnLun+pV6PeH/czUOMALICBz0kcrCUrztuFvAcG9hWwhl8rSlZ1MW3m84m5luOWwk6wWfg2qw5idrMw8AsbEPxqUH2gAhy/Iqgugqq0alTQ7O30zUpNWLPwPayF8Be3QDrsBRXLnCktiIXpPfE5dSNyVlHxOt3OuA10sGrh3+9/dCvI/8kIxbzR0ZOtD5gIGDKvsqg5tYpLVIJ2ouNK2ekr+ceNI5TzznunHJXotjAUSwE3Uo8e2yPk0KgUTjIiTuJ8sbuOWu0bQTyNLOmUa920BaQTuF5QrVnkyNcrP17iGexitEsY2O2rhHGq4aiDAtsldaEVbGw+8+IgQ1AJOzHC4XrPqnm3CNEx4LrzTSwRn/t+uMwkl8asHTtORIG3nFJWPTDq9RfR/G81t3n7KxIK+jdLRyNvyDFnYN0dwS1e55qLHNlE4gUf2bKK5pmOtZTRjScSMlsPMyXezZZONf/5itiY8i82sN4Hrc+Jw7bcCknHXw+xYXdl4f83gpViP8KFxgruErjaFJ+3ILkgPMUYZkDxtab7xXm9x9NJA2HInyYyItvQfQw84KHfrj9F625ZtAesibgtJ/n7dZk0E",
+            "parse_error": null,
+            "raw_arguments": null
+          }
+        ],
+        "provider": "google",
+        "api": "google-generative-ai",
+        "model": "gemini-3-flash-preview",
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "tool",
+        "content": "Using target: local-mi300x\nConnecting to root@localhost:22...\nCreated run directory: /root/.wafer/workspaces/kernelbench/kernelbench_eval_20260121_214625\nRunning KernelBench evaluation in Docker container...\nDocker command: docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -v /root/.wafer/workspaces/ker...\nRequirement already satisfied: uv in /opt/venv/lib/python3.12/site-packages (0.9.26)\n[1/2] hipcc -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=post_matmul_fused_lib -DTORCH_API_INCLUDE_EXTENSION_H -isystem /opt/venv/lib/python3.12/site-packages/torch/include -isystem /opt/venv/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /usr/include/python3.12 -fPIC -std=c++17 -c /root/.cache/torch_extensions/py312_cpu/post_matmul_fused_lib/main.cpp -o main.o -D__HIP_PLATFORM_AMD__=1 -DUSE_ROCM=1 -DHIPBLAS_V2 -fPIC\n[2/2] hipcc main.o -shared -L/opt/venv/lib/python3.12/site-packages/torch/lib -lc10 -ltorch_cpu -ltorch -ltorch_python -o post_matmul_fused_lib.so\n[KernelBench] Modules loaded successfully\n[KernelBench] Models instantiated (seed=42)\n[KernelBench] Correctness: True\n[KernelBench] Running benchmarks...\n[KernelBench] New: 0.138ms, Ref: 1.282ms, Speedup: 9.30x\n[KernelBench] Results written to /workspace/kernelbench_eval_20260121_214625/results.json\n\n============================================================\nResult: PASS\nCorrectness: 1/1 (100.0%)\nSpeedup: 9.30x\n============================================================\n",
+        "provider": null,
+        "api": null,
+        "model": null,
+        "tool_call_id": "bash_1769031979_1",
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "write_1769032037_1",
+            "name": "write",
+            "arguments": {
+              "content": "\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nimport os\n\nos.environ[\"CXX\"] = \"hipcc\"\n\nfused_ops_cpp_source = \"\"\"\n#include <hip/hip_runtime.h>\n#include <torch/extension.h>\n#include <cmath>\n#include <algorithm>\n\n__device__ inline float gelu(float x) {\n    return 0.5f * x * (1.0f + erff(x * M_SQRT1_2));\n}\n\n__global__ void post_matmul_fused_kernel(\n    const float* __restrict__ input, // shape: (batch_size, num_pooled)\n    float* __restrict__ output,       // shape: (batch_size,)\n    int batch_size,\n    int num_pooled,\n    float scale_factor) {\n\n    int row = blockIdx.x;\n    if (row >= batch_size) return;\n\n    extern __shared__ float shared_data[];\n\n    float max_val = -1e20f;\n    for (int i = threadIdx.x; i < num_pooled; i += blockDim.x) {\n        float val = gelu(input[row * num_pooled + i]) * scale_factor;\n        if (val > max_val) max_val = val;\n    }\n\n    shared_data[threadIdx.x] = max_val;\n    __syncthreads();\n\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (threadIdx.x < stride) {\n            shared_data[threadIdx.x] = fmaxf(shared_data[threadIdx.x], shared_data[threadIdx.x + stride]);\n        }\n        __syncthreads();\n    }\n\n    if (threadIdx.x == 0) {\n        output[row] = shared_data[0];\n    }\n}\n\ntorch::Tensor post_matmul_fused_hip(torch::Tensor input, float scale_factor) {\n    int batch_size = input.size(0);\n    int num_pooled = input.size(1);\n    \n    auto output = torch::empty({batch_size}, input.options());\n\n    int block_size = 256;\n    dim3 grid(batch_size);\n    dim3 block(block_size);\n    int shared_mem_size = block_size * sizeof(float);\n\n    post_matmul_fused_kernel<<<grid, block, shared_mem_size>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        batch_size,\n        num_pooled,\n        scale_factor\n    );\n\n    return output;\n}\n\"\"\"\n\npost_matmul_fused_lib = load_inline(\n    name=\"post_matmul_fused_lib\",\n    cpp_sources=fused_ops_cpp_source,\n    functions=[\"post_matmul_fused_hip\"],\n    verbose=True,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):\n        super(ModelNew, self).__init__()\n        self.in_features = in_features\n        self.out_features = out_features\n        self.pool_kernel_size = pool_kernel_size\n        self.scale_factor = float(scale_factor)\n        \n        self.matmul = nn.Linear(in_features, out_features)\n        self.post_matmul_fused_lib = post_matmul_fused_lib\n        \n        # We'll use these to cache the pooled weight/bias\n        self.register_buffer('weight_pooled', None)\n        self.register_buffer('bias_pooled', None)\n\n    def _initialize_pooled_weights(self):\n        # pool the weights and bias\n        with torch.no_grad():\n            w = self.matmul.weight\n            b = self.matmul.bias\n            num_pooled = self.out_features // self.pool_kernel_size\n            \n            # W_pooled: (num_pooled, in_features)\n            wp = w[:num_pooled * self.pool_kernel_size, :].view(\n                num_pooled, self.pool_kernel_size, self.in_features\n            ).mean(dim=1)\n            self.weight_pooled = wp\n            \n            if b is not None:\n                bp = b[:num_pooled * self.pool_kernel_size].view(\n                    num_pooled, self.pool_kernel_size\n                ).mean(dim=1)\n                self.bias_pooled = bp\n            else:\n                self.bias_pooled = None\n\n    def forward(self, x):\n        if self.weight_pooled is None:\n            self._initialize_pooled_weights()\n        \n        # New matmul: (batch_size, in_features) @ (in_features, num_pooled)\n        # weight_pooled is (num_pooled, in_features), so we transpose it.\n        # Ensure x and weights are on the same device and use same dtype\n        x = torch.matmul(x, self.weight_pooled.t())\n        if self.bias_pooled is not None:\n            x = x + self.bias_pooled\n            \n        return self.post_matmul_fused_lib.post_matmul_fused_hip(x, self.scale_factor)\n",
+              "path": "kernel.py"
+            },
+            "thought_signature": "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",
+            "parse_error": null,
+            "raw_arguments": null
+          }
+        ],
+        "provider": "google",
+        "api": "google-generative-ai",
+        "model": "gemini-3-flash-preview",
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "tool",
+        "content": "Successfully wrote 4036 bytes to kernel.py",
+        "provider": null,
+        "api": null,
+        "model": null,
+        "tool_call_id": "write_1769032037_1",
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "bash_1769032039_1",
+            "name": "bash",
+            "arguments": {
+              "command": "wafer evaluate kernelbench --target local-mi300x --implementation kernel.py --reference /root/Wafer/research/KernelBench/KernelBench/level2/98_Matmul_AvgPool_GELU_Scale_Max.py --benchmark --defensive\n"
+            },
+            "thought_signature": "EpMBCpABAXLI2nzwV6DhiV5wGAEI2OUyD2ZHkiRgCcrMy8+i0lMbYM67zjRb7l7/EmWbl/Unywf8xIWkg8CLCdDNOwvLpcI2kjZj60/db54QDOAwhYjnRoqbub6Y08d8U47WB7fs5ONEi/7a0HTDwW04KYZf+hUwXyvNa5ViN0l0FVzlf4d6YtwgEVqBs5rhUM7KhQ/Y",
+            "parse_error": null,
+            "raw_arguments": null
+          }
+        ],
+        "provider": "google",
+        "api": "google-generative-ai",
+        "model": "gemini-3-flash-preview",
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "tool",
+        "content": "Using target: local-mi300x\nConnecting to root@localhost:22...\nCreated run directory: /root/.wafer/workspaces/kernelbench/kernelbench_eval_20260121_214806\nRunning KernelBench evaluation in Docker container...\nDocker command: docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -v /root/.wafer/workspaces/ker...\nRequirement already satisfied: uv in /opt/venv/lib/python3.12/site-packages (0.9.26)\n[1/2] hipcc -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=post_matmul_fused_lib -DTORCH_API_INCLUDE_EXTENSION_H -isystem /opt/venv/lib/python3.12/site-packages/torch/include -isystem /opt/venv/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /usr/include/python3.12 -fPIC -std=c++17 -c /root/.cache/torch_extensions/py312_cpu/post_matmul_fused_lib/main.cpp -o main.o -D__HIP_PLATFORM_AMD__=1 -DUSE_ROCM=1 -DHIPBLAS_V2 -fPIC\n[2/2] hipcc main.o -shared -L/opt/venv/lib/python3.12/site-packages/torch/lib -lc10 -ltorch_cpu -ltorch -ltorch_python -o post_matmul_fused_lib.so\n[KernelBench] Modules loaded successfully\n[KernelBench] Models instantiated (seed=42)\n[KernelBench] Correctness: True\n[KernelBench] Running benchmarks...\n[KernelBench] New: 0.138ms, Ref: 1.265ms, Speedup: 9.16x\n[KernelBench] Results written to /workspace/kernelbench_eval_20260121_214806/results.json\n\n============================================================\nResult: PASS\nCorrectness: 1/1 (100.0%)\nSpeedup: 9.16x\n============================================================\n",
+        "provider": null,
+        "api": null,
+        "model": null,
+        "tool_call_id": "bash_1769032039_1",
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "DONE",
+            "text_signature": null
+          }
+        ],
+        "provider": "google",
+        "api": "google-generative-ai",
+        "model": "gemini-3-flash-preview",
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "\nDONE",
+            "text_signature": null
+          }
+        ],
+        "provider": "google",
+        "api": "google-generative-ai",
+        "model": "gemini-3-flash-preview",
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "assistant",
+        "content": [],
+        "provider": "google",
+        "api": "google-generative-ai",
+        "model": "gemini-3-flash-preview",
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "assistant",
+        "content": [],
+        "provider": "google",
+        "api": "google-generative-ai",
+        "model": "gemini-3-flash-preview",
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "assistant",
+        "content": [],
+        "provider": "google",
+        "api": "google-generative-ai",
+        "model": "gemini-3-flash-preview",
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nimport os\n\nos.environ[\"CXX\"] = \"hipcc\"\n\nfused_ops_cpp_source = \"\"\"\n#include <hip/hip_runtime.h>\n#include <torch/extension.h>\n#include <cmath>\n#include <algorithm>\n\n__device__ inline float gelu(float x) {\n    return 0.5f * x * (1.0f + erff(x * M_SQRT1_2));\n}\n\n__global__ void post_matmul_fused_kernel(\n    const float* __restrict__ input, // shape: (batch_size, num_pooled)\n    float* __restrict__ output,       // shape: (batch_size,)\n    int batch_size,\n    int num_pooled,\n    float scale_factor) {\n\n    int row = blockIdx.x;\n    if (row >= batch_size) return;\n\n    extern __shared__ float shared_data[];\n\n    float max_val = -1e20f;\n    for (int i = threadIdx.x; i < num_pooled; i += blockDim.x) {\n        float val = gelu(input[row * num_pooled + i]) * scale_factor;\n        if (val > max_val) max_val = val;\n    }\n\n    shared_data[threadIdx.x] = max_val;\n    __syncthreads();\n\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (threadIdx.x < stride) {\n            shared_data[threadIdx.x] = fmaxf(shared_data[threadIdx.x], shared_data[threadIdx.x + stride]);\n        }\n        __syncthreads();\n    }\n\n    if (threadIdx.x == 0) {\n        output[row] = shared_data[0];\n    }\n}\n\ntorch::Tensor post_matmul_fused_hip(torch::Tensor input, float scale_factor) {\n    int batch_size = input.size(0);\n    int num_pooled = input.size(1);\n    \n    auto output = torch::empty({batch_size}, input.options());\n\n    int block_size = 256;\n    dim3 grid(batch_size);\n    dim3 block(block_size);\n    int shared_mem_size = block_size * sizeof(float);\n\n    post_matmul_fused_kernel<<<grid, block, shared_mem_size>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        batch_size,\n        num_pooled,\n        scale_factor\n    );\n\n    return output;\n}\n\"\"\"\n\npost_matmul_fused_lib = load_inline(\n    name=\"post_matmul_fused_lib\",\n    cpp_sources=fused_ops_cpp_source,\n    functions=[\"post_matmul_fused_hip\"],\n    verbose=True,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):\n        super(ModelNew, self).__init__()\n        self.in_features = in_features\n        self.out_features = out_features\n        self.pool_kernel_size = pool_kernel_size\n        self.scale_factor = float(scale_factor)\n        \n        self.matmul = nn.Linear(in_features, out_features)\n        self.post_matmul_fused_lib = post_matmul_fused_lib\n        \n        self.register_buffer('weight_pooled', None)\n        self.register_buffer('bias_pooled', None)\n\n    def _initialize_pooled_weights(self):\n        with torch.no_grad():\n            w = self.matmul.weight\n            b = self.matmul.bias\n            num_pooled = self.out_features // self.pool_kernel_size\n            \n            wp = w[:num_pooled * self.pool_kernel_size, :].view(\n                num_pooled, self.pool_kernel_size, self.in_features\n            ).mean(dim=1)\n            self.weight_pooled = wp\n            \n            if b is not None:\n                bp = b[:num_pooled * self.pool_kernel_size].view(\n                    num_pooled, self.pool_kernel_size\n                ).mean(dim=1)\n                self.bias_pooled = bp\n            else:\n                self.bias_pooled = None\n\n    def forward(self, x):\n        if self.weight_pooled is None:\n            self._initialize_pooled_weights()\n        \n        x = torch.matmul(x, self.weight_pooled.t())\n        if self.bias_pooled is not None:\n            x = x + self.bias_pooled\n            \n        return self.post_matmul_fused_lib.post_matmul_fused_hip(x, self.scale_factor)\n\nDONE",
+            "text_signature": null
+          }
+        ],
+        "provider": "google",
+        "api": "google-generative-ai",
+        "model": "gemini-3-flash-preview",
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      }
+    ],
+    "rewards": 0.0,
+    "group": 0,
+    "replica": 0,
+    "advantages": 0.0,
+    "metadata": {
+      "sample_data": {
+        "level": "level2",
+        "problem_id": 97,
+        "problem_path": "/root/Wafer/research/KernelBench/KernelBench/level2/98_Matmul_AvgPool_GELU_Scale_Max.py",
+        "ref_arch_src": "import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    \"\"\"\n    A model implementing the pattern \"Matmul_AvgPool_GELU_Scale_Max\".\n    \"\"\"\n    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):\n        super(Model, self).__init__()\n        self.matmul = nn.Linear(in_features, out_features)\n        self.avg_pool = nn.AvgPool1d(kernel_size=pool_kernel_size)\n        self.scale_factor = scale_factor\n\n    def forward(self, x):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, in_features).\n\n        Returns:\n            torch.Tensor: Output tensor of shape (batch_size, out_features).\n        \"\"\"\n        x = self.matmul(x)\n        x = self.avg_pool(x.unsqueeze(1)).squeeze(1)\n        x = torch.nn.functional.gelu(x)\n        x = x * self.scale_factor\n        x = torch.max(x, dim=1).values\n        return x\n\nbatch_size = 1024\nin_features = 8192\nout_features = 8192\npool_kernel_size = 16\nscale_factor = 2.0\n\ndef get_inputs():\n    return [torch.rand(batch_size, in_features)]\n\ndef get_init_inputs():\n    return [in_features, out_features, pool_kernel_size, scale_factor]",
+        "name": "98_Matmul_AvgPool_GELU_Scale_Max",
+        "expected_answer": "import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    \"\"\"\n    A model implementing the pattern \"Matmul_AvgPool_GELU_Scale_Max\".\n    \"\"\"\n    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):\n        super(Model, self).__init__()\n        self.matmul = nn.Linear(in_features, out_features)\n        self.avg_pool = nn.AvgPool1d(kernel_size=pool_kernel_size)\n        self.scale_factor = scale_factor\n\n    def forward(self, x):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, in_features).\n\n        Returns:\n            torch.Tensor: Output tensor of shape (batch_size, out_features).\n        \"\"\"\n        x = self.matmul(x)\n        x = self.avg_pool(x.unsqueeze(1)).squeeze(1)\n        x = torch.nn.functional.gelu(x)\n        x = x * self.scale_factor\n        x = torch.max(x, dim=1).values\n        return x\n\nbatch_size = 1024\nin_features = 8192\nout_features = 8192\npool_kernel_size = 16\nscale_factor = 2.0\n\ndef get_inputs():\n    return [torch.rand(batch_size, in_features)]\n\ndef get_init_inputs():\n    return [in_features, out_features, pool_kernel_size, scale_factor]",
+        "user_prompt": "Optimize the HIP kernel for 98_Matmul_AvgPool_GELU_Scale_Max",
+        "_sample_id": "sample_0013"
+      }
+    }
+  },
+  "tokens": [],
+  "response_length": 0,
+  "loss_mask": [],
+  "reward": 0.9,
+  "rollout_log_probs": null,
+  "score": {
+    "metrics": [
+      {
+        "name": "judge_score",
+        "value": 0.9,
+        "weight": 1.0,
+        "metadata": {
+          "reasoning": "The agent successfully ran wafer evaluate kernelbench multiple times and achieved excellent results. The final implementation passes correctness tests (100%) and delivers a significant 9.16x speedup. The optimization strategy is sophisticated - it cleverly reduces computation by pooling weights during initialization rather than computing average pooling at runtime, then fuses GELU, scaling, and max reduction into a single efficient HIP kernel using shared memory reduction. The code is well-structured with proper error handling and device compatibility. Minor deduction for the iterative development process, but the final result demonstrates strong GPU optimization skills with verified performance gains."
+        }
+      },
+      {
+        "name": "judge_score_raw",
+        "value": 9.0,
+        "weight": 0.0,
+        "metadata": {}
+      },
+      {
+        "name": "has_response",
+        "value": 1.0,
+        "weight": 0.0,
+        "metadata": {}
+      }
+    ]
+  },
+  "environment_state": {
+    "working_dir": "/root/Wafer/research/evals/ian/kernels/gemini_3_flash_level2_def/sample_0013",
+    "enabled_tools": [
+      "bash",
+      "write"
+    ],
+    "bash_allowlist": [
+      "wafer evaluate",
+      "python",
+      "python3",
+      "ls",
+      "cat",
+      "head",
+      "tail",
+      "wc",
+      "find",
+      "cd",
+      "pwd",
+      "which"
+    ],
+    "bash_denylist": null
+  },
+  "status": "pending",
+  "metadata": {
+    "turns_used": 12,
+    "stop_reason": null,
+    "total_tokens": 12153,
+    "status": "success",
+    "duration_seconds": 624.0015516281128
+  }
+}

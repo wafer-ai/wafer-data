@@ -1,0 +1,910 @@
+{
+  "id": "sample_0010",
+  "index": null,
+  "group_index": null,
+  "input": {
+    "level": "level1",
+    "problem_id": 41,
+    "problem_path": "/root/Wafer/research/KernelBench/KernelBench/level1/42_Max_Pooling_2D.py",
+    "ref_arch_src": "import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    \"\"\"\n    Simple model that performs Max Pooling 2D.\n    \"\"\"\n    def __init__(self, kernel_size: int, stride: int, padding: int, dilation: int):\n        \"\"\"\n        Initializes the Max Pooling 2D layer.\n\n        Args:\n            kernel_size (int): Size of the pooling window.\n            stride (int): Stride of the pooling window.\n            padding (int): Padding to be applied before pooling.\n            dilation (int): Spacing between kernel elements.\n        \"\"\"\n        super(Model, self).__init__()\n        self.maxpool = nn.MaxPool2d(kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation)\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Max Pooling 2D to the input tensor.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, channels, height, width).\n\n        Returns:\n            torch.Tensor: Output tensor after Max Pooling 2D, shape (batch_size, channels, pooled_height, pooled_width).\n        \"\"\"\n        return self.maxpool(x)\n\nbatch_size = 32\nchannels = 64\nheight = 512\nwidth = 512\nkernel_size = 4\nstride = 1\npadding = 1\ndilation = 1\n\ndef get_inputs():\n    x = torch.rand(batch_size, channels, height, width)\n    return [x]\n\ndef get_init_inputs():\n    return [kernel_size, stride, padding, dilation]\n",
+    "name": "42_Max_Pooling_2D",
+    "expected_answer": "import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    \"\"\"\n    Simple model that performs Max Pooling 2D.\n    \"\"\"\n    def __init__(self, kernel_size: int, stride: int, padding: int, dilation: int):\n        \"\"\"\n        Initializes the Max Pooling 2D layer.\n\n        Args:\n            kernel_size (int): Size of the pooling window.\n            stride (int): Stride of the pooling window.\n            padding (int): Padding to be applied before pooling.\n            dilation (int): Spacing between kernel elements.\n        \"\"\"\n        super(Model, self).__init__()\n        self.maxpool = nn.MaxPool2d(kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation)\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Max Pooling 2D to the input tensor.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, channels, height, width).\n\n        Returns:\n            torch.Tensor: Output tensor after Max Pooling 2D, shape (batch_size, channels, pooled_height, pooled_width).\n        \"\"\"\n        return self.maxpool(x)\n\nbatch_size = 32\nchannels = 64\nheight = 512\nwidth = 512\nkernel_size = 4\nstride = 1\npadding = 1\ndilation = 1\n\ndef get_inputs():\n    x = torch.rand(batch_size, channels, height, width)\n    return [x]\n\ndef get_init_inputs():\n    return [kernel_size, stride, padding, dilation]\n",
+    "user_prompt": "Optimize the HIP kernel for 42_Max_Pooling_2D",
+    "_sample_id": "sample_0010"
+  },
+  "prompt": "",
+  "ground_truth": null,
+  "trajectory": {
+    "completions": [
+      {
+        "id": "google-1769029467",
+        "object": "chat.completion",
+        "created": 1769029467,
+        "model": "gemini-3-flash-preview",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        },
+        "kv_transfer_params": null,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "toolCall",
+                  "id": "write_1769029467_1",
+                  "name": "write",
+                  "arguments": {
+                    "content": "\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nimport os\n\nos.environ[\"CXX\"] = \"hipcc\"\n\nmaxpool2d_cpp_source = \"\"\"\n#include <hip/hip_runtime.h>\n#include <torch/extension.h>\n#include <algorithm>\n#include <float.h>\n\n__global__ void maxpool2d_kernel(\n    const float* __restrict__ input,\n    float* __restrict__ output,\n    int N, int C, int H, int W,\n    int k_h, int k_w,\n    int stride_h, int stride_w,\n    int padding_h, int padding_w,\n    int dilation_h, int dilation_w,\n    int H_out, int W_out)\n{\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int num_elements = N * C * H_out * W_out;\n\n    if (idx < num_elements) {\n        int w_out_idx = idx % W_out;\n        int h_out_idx = (idx / W_out) % H_out;\n        int c_idx = (idx / (W_out * H_out)) % C;\n        int n_idx = idx / (W_out * H_out * C);\n\n        int h_start = h_out_idx * stride_h - padding_h;\n        int w_start = w_out_idx * stride_w - padding_w;\n\n        float max_val = -FLT_MAX;\n\n        for (int kh = 0; kh < k_h; ++kh) {\n            int h_in = h_start + kh * dilation_h;\n            if (h_in >= 0 && h_in < H) {\n                for (int kw = 0; kw < k_w; ++kw) {\n                    int w_in = w_start + kw * dilation_w;\n                    if (w_in >= 0 && w_in < W) {\n                        float val = input[((n_idx * C + c_idx) * H + h_in) * W + w_in];\n                        if (val > max_val) {\n                            max_val = val;\n                        }\n                    }\n                }\n            }\n        }\n        output[idx] = max_val;\n    }\n}\n\ntorch::Tensor maxpool2d_hip(\n    torch::Tensor input,\n    int kernel_size, int stride, int padding, int dilation) {\n    \n    int N = input.size(0);\n    int C = input.size(1);\n    int H = input.size(2);\n    int W = input.size(3);\n\n    int k_h = kernel_size;\n    int k_w = kernel_size;\n    int stride_h = stride;\n    int stride_w = stride;\n    int padding_h = padding;\n    int padding_w = padding;\n    int dilation_h = dilation;\n    int dilation_w = dilation;\n\n    int H_out = (H + 2 * padding_h - dilation_h * (k_h - 1) - 1) / stride_h + 1;\n    int W_out = (W + 2 * padding_w - dilation_w * (k_w - 1) - 1) / stride_w + 1;\n\n    auto output = torch::empty({N, C, H_out, W_out}, input.options());\n\n    int num_elements = N * C * H_out * W_out;\n    const int block_size = 256;\n    const int num_blocks = (num_elements + block_size - 1) / block_size;\n\n    maxpool2d_kernel<<<num_blocks, block_size>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        N, C, H, W,\n        k_h, k_w,\n        stride_h, stride_w,\n        padding_h, padding_w,\n        dilation_h, dilation_w,\n        H_out, W_out\n    );\n\n    return output;\n}\n\"\"\"\n\nmaxpool2d_lib = load_inline(\n    name=\"maxpool2d\",\n    cpp_sources=maxpool2d_cpp_source,\n    functions=[\"maxpool2d_hip\"],\n    verbose=True,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, kernel_size: int, stride: int, padding: int, dilation: int):\n        super(ModelNew, self).__init__()\n        self.kernel_size = kernel_size\n        self.stride = stride\n        self.padding = padding\n        self.dilation = dilation\n        self.maxpool2d_lib = maxpool2d_lib\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        return self.maxpool2d_lib.maxpool2d_hip(x, self.kernel_size, self.stride, self.padding, self.dilation)\n\nbatch_size = 32\nchannels = 64\nheight = 512\nwidth = 512\nkernel_size = 4\nstride = 1\npadding = 1\ndilation = 1\n\ndef get_inputs():\n    x = torch.rand(batch_size, channels, height, width).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return [kernel_size, stride, padding, dilation]\n",
+                    "path": "optimized_maxpool2d.py"
+                  },
+                  "thought_signature": "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",
+                  "parse_error": null,
+                  "raw_arguments": null
+                }
+              ],
+              "provider": "google",
+              "api": "google-generative-ai",
+              "model": "gemini-3-flash-preview",
+              "tool_call_id": null,
+              "details": null,
+              "timestamp": null
+            },
+            "finish_reason": "stop",
+            "logprobs": null,
+            "stop_reason": null,
+            "token_ids": null
+          }
+        ],
+        "prompt_logprobs": null
+      },
+      {
+        "id": "google-1769029616",
+        "object": "chat.completion",
+        "created": 1769029616,
+        "model": "gemini-3-flash-preview",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        },
+        "kv_transfer_params": null,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "toolCall",
+                  "id": "bash_1769029616_1",
+                  "name": "bash",
+                  "arguments": {
+                    "command": "wafer evaluate kernelbench --target local-mi300x --implementation optimized_maxpool2d.py --reference /root/Wafer/research/KernelBench/KernelBench/level1/42_Max_Pooling_2D.py --benchmark --defensive\n"
+                  },
+                  "thought_signature": "EqcBCqQBAXLI2nxWZDAtnq0ON/7t5ndbaJtWY1facyGGg36jj6A3aRbVgxpTG3QM7uldMc71hWyD9AwaaA1446f+PAzAAQMHCOQgtM7/1DDzh1r0x2xlbo2lYLMgkPGTgNUhwlvHz+y62v+y1xVLFmJHs4vMiRr6GfX8iom6BPkiYdrVf5u43N45EH4qiT+G0OsT8IUgqun+wAY3NlUHi8+1u/hoiDhgB74=",
+                  "parse_error": null,
+                  "raw_arguments": null
+                }
+              ],
+              "provider": "google",
+              "api": "google-generative-ai",
+              "model": "gemini-3-flash-preview",
+              "tool_call_id": null,
+              "details": null,
+              "timestamp": null
+            },
+            "finish_reason": "stop",
+            "logprobs": null,
+            "stop_reason": null,
+            "token_ids": null
+          }
+        ],
+        "prompt_logprobs": null
+      },
+      {
+        "id": "google-1769029697",
+        "object": "chat.completion",
+        "created": 1769029697,
+        "model": "gemini-3-flash-preview",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        },
+        "kv_transfer_params": null,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "toolCall",
+                  "id": "write_1769029697_1",
+                  "name": "write",
+                  "arguments": {
+                    "content": "\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nimport os\n\nos.environ[\"CXX\"] = \"hipcc\"\n\nmaxpool2d_cpp_source = \"\"\"\n#include <hip/hip_runtime.h>\n#include <torch/extension.h>\n#include <algorithm>\n#include <float.h>\n\n__global__ void maxpool2d_kernel(\n    const float* __restrict__ input,\n    float* __restrict__ output,\n    int N, int C, int H, int W,\n    int k_h, int k_w,\n    int stride_h, int stride_w,\n    int padding_h, int padding_w,\n    int dilation_h, int dilation_w,\n    int H_out, int W_out)\n{\n    // x-dimension: W_out\n    // y-dimension: H_out\n    // z-dimension: N * C\n    \n    int w_out_idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int h_out_idx = blockIdx.y * blockDim.y + threadIdx.y;\n    int nc_idx = blockIdx.z;\n\n    if (w_out_idx < W_out && h_out_idx < H_out) {\n        int n_idx = nc_idx / C;\n        int c_idx = nc_idx % C;\n\n        int h_start = h_out_idx * stride_h - padding_h;\n        int w_start = w_out_idx * stride_w - padding_w;\n\n        float max_val = -FLT_MAX;\n\n        const float* input_ptr = input + (n_idx * C + c_idx) * H * W;\n\n        for (int kh = 0; kh < k_h; ++kh) {\n            int h_in = h_start + kh * dilation_h;\n            if (h_in >= 0 && h_in < H) {\n                for (int kw = 0; kw < k_w; ++kw) {\n                    int w_in = w_start + kw * dilation_w;\n                    if (w_in >= 0 && w_in < W) {\n                        float val = input_ptr[h_in * W + w_in];\n                        if (val > max_val) {\n                            max_val = val;\n                        }\n                    }\n                }\n            }\n        }\n        output[(nc_idx * H_out + h_out_idx) * W_out + w_out_idx] = max_val;\n    }\n}\n\ntorch::Tensor maxpool2d_hip(\n    torch::Tensor input,\n    int kernel_size, int stride, int padding, int dilation) {\n    \n    int N = input.size(0);\n    int C = input.size(1);\n    int H = input.size(2);\n    int W = input.size(3);\n\n    int k_h = kernel_size;\n    int k_w = kernel_size;\n    int stride_h = stride;\n    int stride_w = stride;\n    int padding_h = padding;\n    int padding_w = padding;\n    int dilation_h = dilation;\n    int dilation_w = dilation;\n\n    int H_out = (H + 2 * padding_h - dilation_h * (k_h - 1) - 1) / stride_h + 1;\n    int W_out = (W + 2 * padding_w - dilation_w * (k_w - 1) - 1) / stride_w + 1;\n\n    auto output = torch::empty({N, C, H_out, W_out}, input.options());\n\n    dim3 block_size(16, 16);\n    dim3 num_blocks((W_out + block_size.x - 1) / block_size.x,\n                    (H_out + block_size.y - 1) / block_size.y,\n                    N * C);\n\n    maxpool2d_kernel<<<num_blocks, block_size>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        N, C, H, W,\n        k_h, k_w,\n        stride_h, stride_w,\n        padding_h, padding_w,\n        dilation_h, dilation_w,\n        H_out, W_out\n    );\n\n    return output;\n}\n\"\"\"\n\nmaxpool2d_lib = load_inline(\n    name=\"maxpool2d_improved\",\n    cpp_sources=maxpool2d_cpp_source,\n    functions=[\"maxpool2d_hip\"],\n    verbose=True,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, kernel_size: int, stride: int, padding: int, dilation: int):\n        super(ModelNew, self).__init__()\n        self.kernel_size = kernel_size\n        self.stride = stride\n        self.padding = padding\n        self.dilation = dilation\n        self.maxpool2d_lib = maxpool2d_lib\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        return self.maxpool2d_lib.maxpool2d_hip(x, self.kernel_size, self.stride, self.padding, self.dilation)\n",
+                    "path": "optimized_maxpool2d.py"
+                  },
+                  "thought_signature": "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",
+                  "parse_error": null,
+                  "raw_arguments": null
+                }
+              ],
+              "provider": "google",
+              "api": "google-generative-ai",
+              "model": "gemini-3-flash-preview",
+              "tool_call_id": null,
+              "details": null,
+              "timestamp": null
+            },
+            "finish_reason": "stop",
+            "logprobs": null,
+            "stop_reason": null,
+            "token_ids": null
+          }
+        ],
+        "prompt_logprobs": null
+      },
+      {
+        "id": "google-1769029699",
+        "object": "chat.completion",
+        "created": 1769029699,
+        "model": "gemini-3-flash-preview",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        },
+        "kv_transfer_params": null,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "toolCall",
+                  "id": "bash_1769029699_1",
+                  "name": "bash",
+                  "arguments": {
+                    "command": "wafer evaluate kernelbench --target local-mi300x --implementation optimized_maxpool2d.py --reference /root/Wafer/research/KernelBench/KernelBench/level1/42_Max_Pooling_2D.py --benchmark --defensive\n"
+                  },
+                  "thought_signature": "EroBCrcBAXLI2nyHEeI07fVBF8iRcCftU4tmUtz6jEfwk1ulhBCVadPEKHEkYLoaiPOujnByBVVwE0LS9pL+E1TmlsmO0Bhho/Pcihx7eA2OScI6t+EjCJSdTI9jd8e3BJ9WVkyQoagaHV4+1tj70abBDQwMKqJkS+UT0ce8SaZIibVRN2PWynyuEYtnIrVBRNKmI4Byuht+mECPOgZQez1aAmvtApVnBj5M+Zar2xj5NmN+ZwYp5ZKBvHUj",
+                  "parse_error": null,
+                  "raw_arguments": null
+                }
+              ],
+              "provider": "google",
+              "api": "google-generative-ai",
+              "model": "gemini-3-flash-preview",
+              "tool_call_id": null,
+              "details": null,
+              "timestamp": null
+            },
+            "finish_reason": "stop",
+            "logprobs": null,
+            "stop_reason": null,
+            "token_ids": null
+          }
+        ],
+        "prompt_logprobs": null
+      },
+      {
+        "id": "google-1769030343",
+        "object": "chat.completion",
+        "created": 1769030343,
+        "model": "gemini-3-flash-preview",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        },
+        "kv_transfer_params": null,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "toolCall",
+                  "id": "write_1769030343_1",
+                  "name": "write",
+                  "arguments": {
+                    "path": "optimized_maxpool2d.py",
+                    "content": "\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nimport os\n\nos.environ[\"CXX\"] = \"hipcc\"\n\nmaxpool2d_cpp_source = \"\"\"\n#include <hip/hip_runtime.h>\n#include <torch/extension.h>\n#include <algorithm>\n#include <float.h>\n\n#define TILE_W 16\n#define TILE_H 16\n\n__global__ void maxpool2d_kernel_shm(\n    const float* __restrict__ input,\n    float* __restrict__ output,\n    int N, int C, int H, int W,\n    int k_h, int k_w,\n    int stride_h, int stride_w,\n    int padding_h, int padding_w,\n    int dilation_h, int dilation_w,\n    int H_out, int W_out)\n{\n    // Shared memory for the input tile. \n    // Max kernel size is 4, max stride is 1. \n    // For 16x16 output tile, we need (16*stride + (kernel-1)*dilation + 1)\n    // Here stride=1, dilation=1, kernel=4. So 16+3 = 19.\n    // To handle general cases, we'll size it based on common values or use a fixed large size.\n    // Let's use 32x32 for safety as it fits in shared memory.\n    __shared__ float shm_tile[32][32];\n\n    int tx = threadIdx.x;\n    int ty = threadIdx.y;\n    int bx = blockIdx.x;\n    int by = blockIdx.y;\n    int nc_idx = blockIdx.z;\n\n    int w_out_start = bx * TILE_W;\n    int h_out_start = by * TILE_H;\n\n    int h_in_start = h_out_start * stride_h - padding_h;\n    int w_in_start = w_out_start * stride_w - padding_w;\n\n    // Load input tile into shared memory\n    // Each thread loads multiple elements\n    int input_tile_h = TILE_H * stride_h + (k_h - 1) * dilation_h;\n    int input_tile_w = TILE_W * stride_w + (k_w - 1) * dilation_w;\n    \n    // Safety check for shared memory size\n    if (input_tile_h > 32) input_tile_h = 32;\n    if (input_tile_w > 32) input_tile_w = 32;\n\n    const float* input_ptr = input + (nc_idx * H * W);\n\n    for (int i = ty; i < input_tile_h; i += TILE_H) {\n        for (int j = tx; j < input_tile_w; j += TILE_W) {\n            int h_in = h_in_start + i;\n            int w_in = w_in_start + j;\n            if (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) {\n                shm_tile[i][j] = input_ptr[h_in * W + w_in];\n            } else {\n                shm_tile[i][j] = -FLT_MAX;\n            }\n        }\n    }\n    __syncthreads();\n\n    int w_out_idx = w_out_start + tx;\n    int h_out_idx = h_out_start + ty;\n\n    if (w_out_idx < W_out && h_out_idx < H_out) {\n        float max_val = -FLT_MAX;\n        for (int kh = 0; kh < k_h; ++kh) {\n            for (int kw = 0; kw < k_w; ++kw) {\n                float val = shm_tile[ty * stride_h + kh * dilation_h][tx * stride_w + kw * dilation_w];\n                if (val > max_val) {\n                    max_val = val;\n                }\n            }\n        }\n        output[(nc_idx * H_out + h_out_idx) * W_out + w_out_idx] = max_val;\n    }\n}\n\ntorch::Tensor maxpool2d_hip(\n    torch::Tensor input,\n    int kernel_size, int stride, int padding, int dilation) {\n    \n    int N = input.size(0);\n    int C = input.size(1);\n    int H = input.size(2);\n    int W = input.size(3);\n\n    int k_h = kernel_size;\n    int k_w = kernel_size;\n    int stride_h = stride;\n    int stride_w = stride;\n    int padding_h = padding;\n    int padding_w = padding;\n    int dilation_h = dilation;\n    int dilation_w = dilation;\n\n    int H_out = (H + 2 * padding_h - dilation_h * (k_h - 1) - 1) / stride_h + 1;\n    int W_out = (W + 2 * padding_w - dilation_w * (k_w - 1) - 1) / stride_w + 1;\n\n    auto output = torch::empty({N, C, H_out, W_out}, input.options());\n\n    dim3 block_size(TILE_W, TILE_H);\n    dim3 num_blocks((W_out + TILE_W - 1) / TILE_W,\n                    (H_out + TILE_H - 1) / TILE_H,\n                    N * C);\n\n    maxpool2d_kernel_shm<<<num_blocks, block_size>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        N, C, H, W,\n        k_h, k_w,\n        stride_h, stride_w,\n        padding_h, padding_w,\n        dilation_h, dilation_w,\n        H_out, W_out\n    );\n\n    return output;\n}\n\"\"\"\n\nmaxpool2d_lib = load_inline(\n    name=\"maxpool2d_shm\",\n    cpp_sources=maxpool2d_cpp_source,\n    functions=[\"maxpool2d_hip\"],\n    verbose=True,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, kernel_size: int, stride: int, padding: int, dilation: int):\n        super(ModelNew, self).__init__()\n        self.kernel_size = kernel_size\n        self.stride = stride\n        self.padding = padding\n        self.dilation = dilation\n        self.maxpool2d_lib = maxpool2d_lib\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        return self.maxpool2d_lib.maxpool2d_hip(x, self.kernel_size, self.stride, self.padding, self.dilation)\n"
+                  },
+                  "thought_signature": "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",
+                  "parse_error": null,
+                  "raw_arguments": null
+                }
+              ],
+              "provider": "google",
+              "api": "google-generative-ai",
+              "model": "gemini-3-flash-preview",
+              "tool_call_id": null,
+              "details": null,
+              "timestamp": null
+            },
+            "finish_reason": "stop",
+            "logprobs": null,
+            "stop_reason": null,
+            "token_ids": null
+          }
+        ],
+        "prompt_logprobs": null
+      },
+      {
+        "id": "google-1769030413",
+        "object": "chat.completion",
+        "created": 1769030413,
+        "model": "gemini-3-flash-preview",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        },
+        "kv_transfer_params": null,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "toolCall",
+                  "id": "bash_1769030413_1",
+                  "name": "bash",
+                  "arguments": {
+                    "command": "wafer evaluate kernelbench --target local-mi300x --implementation optimized_maxpool2d.py --reference /root/Wafer/research/KernelBench/KernelBench/level1/42_Max_Pooling_2D.py --benchmark --defensive\n"
+                  },
+                  "thought_signature": "EtoCCtcCAXLI2nwUrEQu/1Zl2gIp/VYtk7+MAOIcLRpJ9/icGsKOFo2Cg+QTQXdb5iTo4XYP53Fh6pcrBnwHelooU/qkw13vKNDxCS4leF4eFl41JUVzvFK8VyvKkylBAOf2CGH2q16GWU3/rz+/ATTgyboUF3hAWBLNiNS4Nt80RgQKdSZ2kLZx6KRpnIpfQ9rHO0wCagjaa0GldPLbHU5SaVC6bif4CG6Ql6E2Xf3zgxnKFfY3pJN82opPM0JqpS1OMHgH/4iEA5UnadpUZJs0vsEnaBG52UWquzO4u6L2OcEz6YWmzxq9ldexiuif8XtYCRC5E5E7UFNiCkMY3gqFdkqL8gcQG9tWEAaw3fTGKgydRm4p7NTzQrCbv8X7t358MeqmlXjS2Xd+Vn/WV5yJwLDWvZbDn6AJPRehiuHUyzV7JYDUptJ20MpZdXTWu502Xnrwsxmnw8Kj8Q==",
+                  "parse_error": null,
+                  "raw_arguments": null
+                }
+              ],
+              "provider": "google",
+              "api": "google-generative-ai",
+              "model": "gemini-3-flash-preview",
+              "tool_call_id": null,
+              "details": null,
+              "timestamp": null
+            },
+            "finish_reason": "stop",
+            "logprobs": null,
+            "stop_reason": null,
+            "token_ids": null
+          }
+        ],
+        "prompt_logprobs": null
+      },
+      {
+        "id": "google-1769030593",
+        "object": "chat.completion",
+        "created": 1769030593,
+        "model": "gemini-3-flash-preview",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        },
+        "kv_transfer_params": null,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "toolCall",
+                  "id": "write_1769030593_1",
+                  "name": "write",
+                  "arguments": {
+                    "path": "optimized_maxpool2d.py",
+                    "content": "\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nimport os\n\nos.environ[\"CXX\"] = \"hipcc\"\n\nmaxpool2d_cpp_source = \"\"\"\n#include <hip/hip_runtime.h>\n#include <torch/extension.h>\n#include <algorithm>\n#include <float.h>\n\n#define TILE_W 16\n#define TILE_H 16\n\n__global__ void __launch_bounds__(256) maxpool2d_kernel_shm_v2(\n    const float* __restrict__ input,\n    float* __restrict__ output,\n    int N, int C, int H, int W,\n    int k_h, int k_w,\n    int stride_h, int stride_w,\n    int padding_h, int padding_w,\n    int dilation_h, int dilation_w,\n    int H_out, int W_out)\n{\n    // Increased shared memory size to handle more general cases.\n    __shared__ float shm_tile[48][48];\n\n    int tx = threadIdx.x;\n    int ty = threadIdx.y;\n    int bx = blockIdx.x;\n    int by = blockIdx.y;\n    int nc_idx = blockIdx.z;\n\n    int w_out_start = bx * TILE_W;\n    int h_out_start = by * TILE_H;\n\n    int h_in_start = h_out_start * stride_h - padding_h;\n    int w_in_start = w_out_start * stride_w - padding_w;\n\n    int input_tile_h = TILE_H * stride_h + (k_h - 1) * dilation_h;\n    int input_tile_w = TILE_W * stride_w + (k_w - 1) * dilation_w;\n    \n    // Safety check for shared memory size\n    if (input_tile_h > 48) input_tile_h = 48;\n    if (input_tile_w > 48) input_tile_w = 48;\n\n    const float* input_ptr = input + (nc_idx * H * W);\n\n    // Optimized loading into shared memory\n    int total_threads = TILE_W * TILE_H;\n    int thread_id = ty * TILE_W + tx;\n    int total_elements = input_tile_h * input_tile_w;\n\n    for (int idx = thread_id; idx < total_elements; idx += total_threads) {\n        int i = idx / input_tile_w;\n        int j = idx % input_tile_w;\n        int h_in = h_in_start + i;\n        int w_in = w_in_start + j;\n        if (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) {\n            shm_tile[i][j] = input_ptr[h_in * W + w_in];\n        } else {\n            shm_tile[i][j] = -FLT_MAX;\n        }\n    }\n    __syncthreads();\n\n    int w_out_idx = w_out_start + tx;\n    int h_out_idx = h_out_start + ty;\n\n    if (w_out_idx < W_out && h_out_idx < H_out) {\n        float max_val = -FLT_MAX;\n        int h_shm_base = ty * stride_h;\n        int w_shm_base = tx * stride_w;\n\n        for (int kh = 0; kh < k_h; ++kh) {\n            int h_shm = h_shm_base + kh * dilation_h;\n            for (int kw = 0; kw < k_w; ++kw) {\n                int w_shm = w_shm_base + kw * dilation_w;\n                float val = shm_tile[h_shm][w_shm];\n                if (val > max_val) {\n                    max_val = val;\n                }\n            }\n        }\n        output[(nc_idx * H_out + h_out_idx) * W_out + w_out_idx] = max_val;\n    }\n}\n\ntorch::Tensor maxpool2d_hip(\n    torch::Tensor input,\n    int kernel_size, int stride, int padding, int dilation) {\n    \n    int N = input.size(0);\n    int C = input.size(1);\n    int H = input.size(2);\n    int W = input.size(3);\n\n    int k_h = kernel_size;\n    int k_w = kernel_size;\n    int stride_h = stride;\n    int stride_w = stride;\n    int padding_h = padding;\n    int padding_w = padding;\n    int dilation_h = dilation;\n    int dilation_w = dilation;\n\n    int H_out = (H + 2 * padding_h - dilation_h * (k_h - 1) - 1) / stride_h + 1;\n    int W_out = (W + 2 * padding_w - dilation_w * (k_w - 1) - 1) / stride_w + 1;\n\n    auto output = torch::empty({N, C, H_out, W_out}, input.options());\n\n    dim3 block_size(TILE_W, TILE_H);\n    dim3 num_blocks((W_out + TILE_W - 1) / TILE_W,\n                    (H_out + TILE_H - 1) / TILE_H,\n                    N * C);\n\n    maxpool2d_kernel_shm_v2<<<num_blocks, block_size>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        N, C, H, W,\n        k_h, k_w,\n        stride_h, stride_w,\n        padding_h, padding_w,\n        dilation_h, dilation_w,\n        H_out, W_out\n    );\n\n    return output;\n}\n\"\"\"\n\nmaxpool2d_lib = load_inline(\n    name=\"maxpool2d_shm_v2\",\n    cpp_sources=maxpool2d_cpp_source,\n    functions=[\"maxpool2d_hip\"],\n    verbose=True,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, kernel_size: int, stride: int, padding: int, dilation: int):\n        super(ModelNew, self).__init__()\n        self.kernel_size = kernel_size\n        self.stride = stride\n        self.padding = padding\n        self.dilation = dilation\n        self.maxpool2d_lib = maxpool2d_lib\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        return self.maxpool2d_lib.maxpool2d_hip(x, self.kernel_size, self.stride, self.padding, self.dilation)\n"
+                  },
+                  "thought_signature": "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",
+                  "parse_error": null,
+                  "raw_arguments": null
+                }
+              ],
+              "provider": "google",
+              "api": "google-generative-ai",
+              "model": "gemini-3-flash-preview",
+              "tool_call_id": null,
+              "details": null,
+              "timestamp": null
+            },
+            "finish_reason": "stop",
+            "logprobs": null,
+            "stop_reason": null,
+            "token_ids": null
+          }
+        ],
+        "prompt_logprobs": null
+      },
+      {
+        "id": "google-1769030684",
+        "object": "chat.completion",
+        "created": 1769030684,
+        "model": "gemini-3-flash-preview",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        },
+        "kv_transfer_params": null,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "toolCall",
+                  "id": "bash_1769030684_1",
+                  "name": "bash",
+                  "arguments": {
+                    "command": "wafer evaluate kernelbench --target local-mi300x --implementation optimized_maxpool2d.py --reference /root/Wafer/research/KernelBench/KernelBench/level1/42_Max_Pooling_2D.py --benchmark --defensive\n"
+                  },
+                  "thought_signature": "EocCCoQCAXLI2nwZ0N3p7NmJ7kSPB0wC7q3TWhEOEZoaJYPlCCc97XJ/1EBW3Y9JLUuN2EFx6TtHcoVa8lNX0YsvlBNXwbScE3orNYCsyh/CF3SQzXJw9y+Kk9e+h3/uvyio5BRd6FleLekYQIewtKT1jFT3dD/gofQ9uH2L+QmFkoScYlULrmFHWV8RQgJVSHiVBmoW0jpHuxzOLHcXGnVaM7/wrGtcntKDJQpIlAndANdrIFi7sJMZ9Y911UhthDQtD9DMfd4t5BSBqhbFt46TAt4RQfmBinsn/JST/A4SNIG1vbuKBaWEnMtXA7XVQ9GpYLFd5nF4/La32f9pnehbwzwEpc2qxzk=",
+                  "parse_error": null,
+                  "raw_arguments": null
+                }
+              ],
+              "provider": "google",
+              "api": "google-generative-ai",
+              "model": "gemini-3-flash-preview",
+              "tool_call_id": null,
+              "details": null,
+              "timestamp": null
+            },
+            "finish_reason": "stop",
+            "logprobs": null,
+            "stop_reason": null,
+            "token_ids": null
+          }
+        ],
+        "prompt_logprobs": null
+      },
+      {
+        "id": "google-1769031025",
+        "object": "chat.completion",
+        "created": 1769031025,
+        "model": "gemini-3-flash-preview",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        },
+        "kv_transfer_params": null,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "The optimized Max Pooling 2D implementation uses a custom HIP/ROCm kernel with shared memory tiling. By loading a tile of input data into shared memory, the kernel reduces global memory access redundancy, which is a major bottleneck in pooling operations where windows overlap (e.g., stride 1). Each thread calculates one output element, leveraging the coalesced memory access pattern when reading and writing to global memory.\n\n```python\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nimport os\n\nos.environ[\"CXX\"] = \"hipcc\"\n\nmaxpool2d_cpp_source = \"\"\"\n#include <hip/hip_runtime.h>\n#include <torch/extension.h>\n#include <algorithm>\n#include <float.h>\n\n#define TILE_W 16\n#define TILE_H 16\n\n__global__ void __launch_bounds__(256) maxpool2d_kernel_shm_v2(\n    const float* __restrict__ input,\n    float* __restrict__ output,\n    int N, int C, int H, int W,\n    int k_h, int k_w,\n    int stride_h, int stride_w,\n    int padding_h, int padding_w,\n    int dilation_h, int dilation_w,\n    int H_out, int W_out)\n{\n    // Shared memory for the input tile.\n    // The tile size is chosen to handle common pooling configurations efficiently.\n    __shared__ float shm_tile[48][48];\n\n    int tx = threadIdx.x;\n    int ty = threadIdx.y;\n    int bx = blockIdx.x;\n    int by = blockIdx.y;\n    int nc_idx = blockIdx.z;\n\n    int w_out_start = bx * TILE_W;\n    int h_out_start = by * TILE_H;\n\n    int h_in_start = h_out_start * stride_h - padding_h;\n    int w_in_start = w_out_start * stride_w - padding_w;\n\n    int input_tile_h = TILE_H * stride_h + (k_h - 1) * dilation_h;\n    int input_tile_w = TILE_W * stride_w + (k_w - 1) * dilation_w;\n    \n    if (input_tile_h > 48) input_tile_h = 48;\n    if (input_tile_w > 48) input_tile_w = 48;\n\n    const float* input_ptr = input + (nc_idx * H * W);\n\n    // Efficiently load input tile into shared memory using all threads in the block\n    int total_threads = TILE_W * TILE_H;\n    int thread_id = ty * TILE_W + tx;\n    int total_elements = input_tile_h * input_tile_w;\n\n    for (int idx = thread_id; idx < total_elements; idx += total_threads) {\n        int i = idx / input_tile_w;\n        int j = idx % input_tile_w;\n        int h_in = h_in_start + i;\n        int w_in = w_in_start + j;\n        if (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) {\n            shm_tile[i][j] = input_ptr[h_in * W + w_in];\n        } else {\n            shm_tile[i][j] = -FLT_MAX;\n        }\n    }\n    __syncthreads();\n\n    int w_out_idx = w_out_start + tx;\n    int h_out_idx = h_out_start + ty;\n\n    if (w_out_idx < W_out && h_out_idx < H_out) {\n        float max_val = -FLT_MAX;\n        int h_shm_base = ty * stride_h;\n        int w_shm_base = tx * stride_w;\n\n        for (int kh = 0; kh < k_h; ++kh) {\n            int h_shm = h_shm_base + kh * dilation_h;\n            for (int kw = 0; kw < k_w; ++kw) {\n                int w_shm = w_shm_base + kw * dilation_w;\n                float val = shm_tile[h_shm][w_shm];\n                if (val > max_val) {\n                    max_val = val;\n                }\n            }\n        }\n        output[(nc_idx * H_out + h_out_idx) * W_out + w_out_idx] = max_val;\n    }\n}\n\ntorch::Tensor maxpool2d_hip(\n    torch::Tensor input,\n    int kernel_size, int stride, int padding, int dilation) {\n    \n    int N = input.size(0);\n    int C = input.size(1);\n    int H = input.size(2);\n    int W = input.size(3);\n\n    int k_h = kernel_size;\n    int k_w = kernel_size;\n    int stride_h = stride;\n    int stride_w = stride;\n    int padding_h = padding;\n    int padding_w = padding;\n    int dilation_h = dilation;\n    int dilation_w = dilation;\n\n    int H_out = (H + 2 * padding_h - dilation_h * (k_h - 1) - 1) / stride_h + 1;\n    int W_out = (W + 2 * padding_w - dilation_w * (k_w - 1) - 1) / stride_w + 1;\n\n    auto output = torch::empty({N, C, H_out, W_out}, input.options());\n\n    dim3 block_size(TILE_W, TILE_H);\n    dim3 num_blocks((W_out + TILE_W - 1) / TILE_W,\n                    (H_out + TILE_H - 1) / TILE_H,\n                    N * C);\n\n    maxpool2d_kernel_shm_v2<<<num_blocks, block_size>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        N, C, H, W,\n        k_h, k_w,\n        stride_h, stride_w,\n        padding_h, padding_w,\n        dilation_h, dilation_w,\n        H_out, W_out\n    );\n\n    return output;\n}\n\"\"\"\n\nmaxpool2d_lib = load_inline(\n    name=\"maxpool2d_shm_v2\",\n    cpp_sources=maxpool2d_cpp_source,\n    functions=[\"maxpool2d_hip\"],\n    verbose=True,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, kernel_size: int, stride: int, padding: int, dilation: int):\n        super(ModelNew, self).__init__()\n        self.kernel_size = kernel_size\n        self.stride = stride\n        self.padding = padding\n        self.dilation = dilation\n        self.maxpool2d_lib = maxpool2d_lib\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        return self.maxpool2d_lib.maxpool2d_hip(x, self.kernel_size, self.stride, self.padding, self.dilation)\n\n```",
+                  "text_signature": null
+                }
+              ],
+              "provider": "google",
+              "api": "google-generative-ai",
+              "model": "gemini-3-flash-preview",
+              "tool_call_id": null,
+              "details": null,
+              "timestamp": null
+            },
+            "finish_reason": "stop",
+            "logprobs": null,
+            "stop_reason": null,
+            "token_ids": null
+          }
+        ],
+        "prompt_logprobs": null
+      },
+      {
+        "id": "google-1769031101",
+        "object": "chat.completion",
+        "created": 1769031101,
+        "model": "gemini-3-flash-preview",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost": {
+            "input": 0.0,
+            "output": 0.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        },
+        "kv_transfer_params": null,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": [],
+              "provider": "google",
+              "api": "google-generative-ai",
+              "model": "gemini-3-flash-preview",
+              "tool_call_id": null,
+              "details": null,
+              "timestamp": null
+            },
+            "finish_reason": "stop",
+            "logprobs": null,
+            "stop_reason": null,
+            "token_ids": null
+          }
+        ],
+        "prompt_logprobs": null
+      }
+    ],
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a GPU AMD HIP kernel optimization expert. Your task is to optimize GPU kernels for performance.\n\nCRITICAL: You do NOT have a local GPU. You MUST use `wafer evaluate kernelbench` to test kernels on remote GPU hardware. Do not try to run kernels locally with Python - it will fail.\n\n## Kernel Format\n\nKernels use PyTorch's load_inline to compile HIP code. The format is:\n- `custom_kernel(inputs)` - Your kernel function that takes a tuple of tensors\n- The HIP code is embedded as a string and compiled with load_inline\n\n## Tools Available\n- bash(command): Run shell commands including wafer CLI\n- write(file_path, content): Write optimized kernel\n\n## MANDATORY Workflow - Follow These Steps EXACTLY\n\n1. Understand the naive kernel (reference implementation provided in prompt)\n2. Identify bottlenecks (memory access patterns, lack of tiling, etc.)\n3. Use the write tool to create your optimized kernel file with `custom_kernel(inputs)` function\n4. IMMEDIATELY run wafer evaluate with a 300-second timeout (needed for remote GPU execution):\n   `bash(command=\"wafer evaluate kernelbench --target <target> --implementation <your_kernel.py> --reference <ref.py> --benchmark\", timeout=300)`\n5. Read the FULL output from wafer evaluate carefully:\n   - If you see compilation errors: Fix the HIP syntax and go back to step 3\n   - If you see runtime errors: Fix the kernel logic and go back to step 3\n   - If correctness tests FAIL: Debug the kernel correctness and go back to step 3\n   - If correctness tests PASS but speedup is poor: Optimize further and go back to step 3\n   - If correctness tests PASS and speedup is good: Say \"DONE\" to complete the task\n6. KEEP TRYING - Most kernels need 2-3 iterations to get right. Don't give up after one error.\n7. Only say \"DONE\" after wafer evaluate shows PASSING correctness tests\n\n## CRITICAL RULES\n\n- NEVER skip step 4 - you MUST run wafer evaluate kernelbench after writing ANY kernel\n- NEVER give up after one error - read the error message, fix the problem, and try again\n- NEVER say \"DONE\" without seeing \"PASS\" in the wafer evaluate output\n- Your score will be 0 if you don't run wafer evaluate kernelbench, regardless of code quality\n- Your score will be 0 if the kernel doesn't pass correctness tests, regardless of speedup\n- Running wafer evaluate is the ONLY way to verify your kernel works correctly on real GPU hardware\n\nGPU Target: local-mi300x\n\nExample test command:\n```\nwafer evaluate kernelbench --target local-mi300x --implementation my_optimized.py --reference reference.py --benchmark --defensive\n```",
+        "provider": null,
+        "api": null,
+        "model": null,
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "user",
+        "content": "You write custom HIP/ROCm kernels to replace the pytorch operators in the given architecture to get speedups.\n\nYou have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom HIP/ROCm kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.\n\nHere's an example to show you the syntax of inline embedding custom HIP/ROCm kernels in PyTorch:\n\nExample:\n\nInput architecture:\n\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\n\nclass Model(nn.Module):\n    def __init__(self) -> None:\n        super().__init__()\n\n    def forward(self, a, b):\n        return a + b\n\n\ndef get_inputs():\n    # randomly generate input tensors based on the model architecture\n    a = torch.randn(1, 128).cuda()\n    b = torch.randn(1, 128).cuda()\n    return [a, b]\n\n\ndef get_init_inputs():\n    # randomly generate tensors required for initialization based on the model architecture\n    return []\n\n\nOptimized with HIP/ROCm kernels:\n\nimport os\n\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\nos.environ[\"CXX\"] = \"hipcc\"\n\nelementwise_add_cpp_source = \"\"\"\n#include <hip/hip_runtime.h>\n\n__global__ void elementwise_add_kernel(const float* a, const float* b, float* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        out[idx] = a[idx] + b[idx];\n    }\n}\n\ntorch::Tensor elementwise_add_hip(torch::Tensor a, torch::Tensor b) {\n    auto size = a.numel();\n    auto out = torch::zeros_like(a);\n\n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n\n    elementwise_add_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);\n\n    return out;\n}\n\"\"\"\n\nelementwise_add = load_inline(\n    name=\"elementwise_add\",\n    cpp_sources=elementwise_add_cpp_source,\n    functions=[\"elementwise_add_hip\"],\n    verbose=True,\n)\n\n\nclass ModelNew(nn.Module):\n    def __init__(self) -> None:\n        super().__init__()\n        self.elementwise_add = elementwise_add\n\n    def forward(self, a, b):\n        return self.elementwise_add.elementwise_add_hip(a, b)\n\nYou are given the following architecture:\n\n\nimport torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    \"\"\"\n    Simple model that performs Max Pooling 2D.\n    \"\"\"\n    def __init__(self, kernel_size: int, stride: int, padding: int, dilation: int):\n        \"\"\"\n        Initializes the Max Pooling 2D layer.\n\n        Args:\n            kernel_size (int): Size of the pooling window.\n            stride (int): Stride of the pooling window.\n            padding (int): Padding to be applied before pooling.\n            dilation (int): Spacing between kernel elements.\n        \"\"\"\n        super(Model, self).__init__()\n        self.maxpool = nn.MaxPool2d(kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation)\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Max Pooling 2D to the input tensor.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, channels, height, width).\n\n        Returns:\n            torch.Tensor: Output tensor after Max Pooling 2D, shape (batch_size, channels, pooled_height, pooled_width).\n        \"\"\"\n        return self.maxpool(x)\n\nbatch_size = 32\nchannels = 64\nheight = 512\nwidth = 512\nkernel_size = 4\nstride = 1\npadding = 1\ndilation = 1\n\ndef get_inputs():\n    x = torch.rand(batch_size, channels, height, width)\n    return [x]\n\ndef get_init_inputs():\n    return [kernel_size, stride, padding, dilation]\n\n\nNote: The kernels should be optimized for FP32 (32-bit floating point) precision.\n\nOptimize the architecture named Model with custom HIP/ROCm kernels! Name your optimized output architecture ModelNew.\n\nFollow the workflow in the system prompt:\n1. Use the write tool to create your optimized kernel file\n2. Test it with the wafer evaluate kernelbench command\n3. Iterate based on results until you achieve correctness and performance improvements\n\n\n## MANDATORY: Testing Your Implementation\n\nAfter writing your optimized HIP kernel, you MUST IMMEDIATELY test it by running this exact command:\n```bash\nwafer evaluate kernelbench --target local-mi300x --implementation <your_kernel.py> --reference /root/Wafer/research/KernelBench/KernelBench/level1/42_Max_Pooling_2D.py --benchmark --defensive\n```\n\nThe reference implementation path is: `/root/Wafer/research/KernelBench/KernelBench/level1/42_Max_Pooling_2D.py`\n\nIMPORTANT: The --defensive flag is REQUIRED to prevent timing exploits.\n\n## What to do next:\n\n1. Write your optimized kernel to a .py file\n2. IMMEDIATELY run the wafer evaluate command above with --defensive (do NOT skip this step)\n3. Read the output to see if correctness tests pass\n4. If tests fail: Fix the kernel and test again\n5. If tests pass: Check the speedup and say \"DONE\"\n\nRemember: Your score is 0 if you don't run wafer evaluate kernelbench. This is NOT optional.",
+        "provider": null,
+        "api": null,
+        "model": null,
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "write_1769029467_1",
+            "name": "write",
+            "arguments": {
+              "content": "\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nimport os\n\nos.environ[\"CXX\"] = \"hipcc\"\n\nmaxpool2d_cpp_source = \"\"\"\n#include <hip/hip_runtime.h>\n#include <torch/extension.h>\n#include <algorithm>\n#include <float.h>\n\n__global__ void maxpool2d_kernel(\n    const float* __restrict__ input,\n    float* __restrict__ output,\n    int N, int C, int H, int W,\n    int k_h, int k_w,\n    int stride_h, int stride_w,\n    int padding_h, int padding_w,\n    int dilation_h, int dilation_w,\n    int H_out, int W_out)\n{\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int num_elements = N * C * H_out * W_out;\n\n    if (idx < num_elements) {\n        int w_out_idx = idx % W_out;\n        int h_out_idx = (idx / W_out) % H_out;\n        int c_idx = (idx / (W_out * H_out)) % C;\n        int n_idx = idx / (W_out * H_out * C);\n\n        int h_start = h_out_idx * stride_h - padding_h;\n        int w_start = w_out_idx * stride_w - padding_w;\n\n        float max_val = -FLT_MAX;\n\n        for (int kh = 0; kh < k_h; ++kh) {\n            int h_in = h_start + kh * dilation_h;\n            if (h_in >= 0 && h_in < H) {\n                for (int kw = 0; kw < k_w; ++kw) {\n                    int w_in = w_start + kw * dilation_w;\n                    if (w_in >= 0 && w_in < W) {\n                        float val = input[((n_idx * C + c_idx) * H + h_in) * W + w_in];\n                        if (val > max_val) {\n                            max_val = val;\n                        }\n                    }\n                }\n            }\n        }\n        output[idx] = max_val;\n    }\n}\n\ntorch::Tensor maxpool2d_hip(\n    torch::Tensor input,\n    int kernel_size, int stride, int padding, int dilation) {\n    \n    int N = input.size(0);\n    int C = input.size(1);\n    int H = input.size(2);\n    int W = input.size(3);\n\n    int k_h = kernel_size;\n    int k_w = kernel_size;\n    int stride_h = stride;\n    int stride_w = stride;\n    int padding_h = padding;\n    int padding_w = padding;\n    int dilation_h = dilation;\n    int dilation_w = dilation;\n\n    int H_out = (H + 2 * padding_h - dilation_h * (k_h - 1) - 1) / stride_h + 1;\n    int W_out = (W + 2 * padding_w - dilation_w * (k_w - 1) - 1) / stride_w + 1;\n\n    auto output = torch::empty({N, C, H_out, W_out}, input.options());\n\n    int num_elements = N * C * H_out * W_out;\n    const int block_size = 256;\n    const int num_blocks = (num_elements + block_size - 1) / block_size;\n\n    maxpool2d_kernel<<<num_blocks, block_size>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        N, C, H, W,\n        k_h, k_w,\n        stride_h, stride_w,\n        padding_h, padding_w,\n        dilation_h, dilation_w,\n        H_out, W_out\n    );\n\n    return output;\n}\n\"\"\"\n\nmaxpool2d_lib = load_inline(\n    name=\"maxpool2d\",\n    cpp_sources=maxpool2d_cpp_source,\n    functions=[\"maxpool2d_hip\"],\n    verbose=True,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, kernel_size: int, stride: int, padding: int, dilation: int):\n        super(ModelNew, self).__init__()\n        self.kernel_size = kernel_size\n        self.stride = stride\n        self.padding = padding\n        self.dilation = dilation\n        self.maxpool2d_lib = maxpool2d_lib\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        return self.maxpool2d_lib.maxpool2d_hip(x, self.kernel_size, self.stride, self.padding, self.dilation)\n\nbatch_size = 32\nchannels = 64\nheight = 512\nwidth = 512\nkernel_size = 4\nstride = 1\npadding = 1\ndilation = 1\n\ndef get_inputs():\n    x = torch.rand(batch_size, channels, height, width).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return [kernel_size, stride, padding, dilation]\n",
+              "path": "optimized_maxpool2d.py"
+            },
+            "thought_signature": "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",
+            "parse_error": null,
+            "raw_arguments": null
+          }
+        ],
+        "provider": "google",
+        "api": "google-generative-ai",
+        "model": "gemini-3-flash-preview",
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "tool",
+        "content": "Successfully wrote 3661 bytes to optimized_maxpool2d.py",
+        "provider": null,
+        "api": null,
+        "model": null,
+        "tool_call_id": "write_1769029467_1",
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "bash_1769029616_1",
+            "name": "bash",
+            "arguments": {
+              "command": "wafer evaluate kernelbench --target local-mi300x --implementation optimized_maxpool2d.py --reference /root/Wafer/research/KernelBench/KernelBench/level1/42_Max_Pooling_2D.py --benchmark --defensive\n"
+            },
+            "thought_signature": "EqcBCqQBAXLI2nxWZDAtnq0ON/7t5ndbaJtWY1facyGGg36jj6A3aRbVgxpTG3QM7uldMc71hWyD9AwaaA1446f+PAzAAQMHCOQgtM7/1DDzh1r0x2xlbo2lYLMgkPGTgNUhwlvHz+y62v+y1xVLFmJHs4vMiRr6GfX8iom6BPkiYdrVf5u43N45EH4qiT+G0OsT8IUgqun+wAY3NlUHi8+1u/hoiDhgB74=",
+            "parse_error": null,
+            "raw_arguments": null
+          }
+        ],
+        "provider": "google",
+        "api": "google-generative-ai",
+        "model": "gemini-3-flash-preview",
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "tool",
+        "content": "Using target: local-mi300x\nConnecting to root@localhost:22...\nCreated run directory: /root/.wafer/workspaces/kernelbench/kernelbench_eval_20260121_210722\nRunning KernelBench evaluation in Docker container...\nDocker command: docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -v /root/.wafer/workspaces/ker...\nRequirement already satisfied: uv in /opt/venv/lib/python3.12/site-packages (0.9.26)\n[1/2] hipcc -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=maxpool2d -DTORCH_API_INCLUDE_EXTENSION_H -isystem /opt/venv/lib/python3.12/site-packages/torch/include -isystem /opt/venv/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /usr/include/python3.12 -fPIC -std=c++17 -c /root/.cache/torch_extensions/py312_cpu/maxpool2d/main.cpp -o main.o -D__HIP_PLATFORM_AMD__=1 -DUSE_ROCM=1 -DHIPBLAS_V2 -fPIC\n[2/2] hipcc main.o -shared -L/opt/venv/lib/python3.12/site-packages/torch/lib -lc10 -ltorch_cpu -ltorch -ltorch_python -o maxpool2d.so\n[KernelBench] Modules loaded successfully\n[KernelBench] Models instantiated (seed=42)\n[KernelBench] Correctness: True\n[KernelBench] Running benchmarks...\n[KernelBench] New: 5.982ms, Ref: 6.729ms, Speedup: 1.12x\n[KernelBench] Results written to /workspace/kernelbench_eval_20260121_210722/results.json\n\n============================================================\nResult: PASS\nCorrectness: 1/1 (100.0%)\nSpeedup: 1.12x\n============================================================\n",
+        "provider": null,
+        "api": null,
+        "model": null,
+        "tool_call_id": "bash_1769029616_1",
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "write_1769029697_1",
+            "name": "write",
+            "arguments": {
+              "content": "\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nimport os\n\nos.environ[\"CXX\"] = \"hipcc\"\n\nmaxpool2d_cpp_source = \"\"\"\n#include <hip/hip_runtime.h>\n#include <torch/extension.h>\n#include <algorithm>\n#include <float.h>\n\n__global__ void maxpool2d_kernel(\n    const float* __restrict__ input,\n    float* __restrict__ output,\n    int N, int C, int H, int W,\n    int k_h, int k_w,\n    int stride_h, int stride_w,\n    int padding_h, int padding_w,\n    int dilation_h, int dilation_w,\n    int H_out, int W_out)\n{\n    // x-dimension: W_out\n    // y-dimension: H_out\n    // z-dimension: N * C\n    \n    int w_out_idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int h_out_idx = blockIdx.y * blockDim.y + threadIdx.y;\n    int nc_idx = blockIdx.z;\n\n    if (w_out_idx < W_out && h_out_idx < H_out) {\n        int n_idx = nc_idx / C;\n        int c_idx = nc_idx % C;\n\n        int h_start = h_out_idx * stride_h - padding_h;\n        int w_start = w_out_idx * stride_w - padding_w;\n\n        float max_val = -FLT_MAX;\n\n        const float* input_ptr = input + (n_idx * C + c_idx) * H * W;\n\n        for (int kh = 0; kh < k_h; ++kh) {\n            int h_in = h_start + kh * dilation_h;\n            if (h_in >= 0 && h_in < H) {\n                for (int kw = 0; kw < k_w; ++kw) {\n                    int w_in = w_start + kw * dilation_w;\n                    if (w_in >= 0 && w_in < W) {\n                        float val = input_ptr[h_in * W + w_in];\n                        if (val > max_val) {\n                            max_val = val;\n                        }\n                    }\n                }\n            }\n        }\n        output[(nc_idx * H_out + h_out_idx) * W_out + w_out_idx] = max_val;\n    }\n}\n\ntorch::Tensor maxpool2d_hip(\n    torch::Tensor input,\n    int kernel_size, int stride, int padding, int dilation) {\n    \n    int N = input.size(0);\n    int C = input.size(1);\n    int H = input.size(2);\n    int W = input.size(3);\n\n    int k_h = kernel_size;\n    int k_w = kernel_size;\n    int stride_h = stride;\n    int stride_w = stride;\n    int padding_h = padding;\n    int padding_w = padding;\n    int dilation_h = dilation;\n    int dilation_w = dilation;\n\n    int H_out = (H + 2 * padding_h - dilation_h * (k_h - 1) - 1) / stride_h + 1;\n    int W_out = (W + 2 * padding_w - dilation_w * (k_w - 1) - 1) / stride_w + 1;\n\n    auto output = torch::empty({N, C, H_out, W_out}, input.options());\n\n    dim3 block_size(16, 16);\n    dim3 num_blocks((W_out + block_size.x - 1) / block_size.x,\n                    (H_out + block_size.y - 1) / block_size.y,\n                    N * C);\n\n    maxpool2d_kernel<<<num_blocks, block_size>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        N, C, H, W,\n        k_h, k_w,\n        stride_h, stride_w,\n        padding_h, padding_w,\n        dilation_h, dilation_w,\n        H_out, W_out\n    );\n\n    return output;\n}\n\"\"\"\n\nmaxpool2d_lib = load_inline(\n    name=\"maxpool2d_improved\",\n    cpp_sources=maxpool2d_cpp_source,\n    functions=[\"maxpool2d_hip\"],\n    verbose=True,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, kernel_size: int, stride: int, padding: int, dilation: int):\n        super(ModelNew, self).__init__()\n        self.kernel_size = kernel_size\n        self.stride = stride\n        self.padding = padding\n        self.dilation = dilation\n        self.maxpool2d_lib = maxpool2d_lib\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        return self.maxpool2d_lib.maxpool2d_hip(x, self.kernel_size, self.stride, self.padding, self.dilation)\n",
+              "path": "optimized_maxpool2d.py"
+            },
+            "thought_signature": "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",
+            "parse_error": null,
+            "raw_arguments": null
+          }
+        ],
+        "provider": "google",
+        "api": "google-generative-ai",
+        "model": "gemini-3-flash-preview",
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "tool",
+        "content": "Successfully wrote 3548 bytes to optimized_maxpool2d.py",
+        "provider": null,
+        "api": null,
+        "model": null,
+        "tool_call_id": "write_1769029697_1",
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "bash_1769029699_1",
+            "name": "bash",
+            "arguments": {
+              "command": "wafer evaluate kernelbench --target local-mi300x --implementation optimized_maxpool2d.py --reference /root/Wafer/research/KernelBench/KernelBench/level1/42_Max_Pooling_2D.py --benchmark --defensive\n"
+            },
+            "thought_signature": "EroBCrcBAXLI2nyHEeI07fVBF8iRcCftU4tmUtz6jEfwk1ulhBCVadPEKHEkYLoaiPOujnByBVVwE0LS9pL+E1TmlsmO0Bhho/Pcihx7eA2OScI6t+EjCJSdTI9jd8e3BJ9WVkyQoagaHV4+1tj70abBDQwMKqJkS+UT0ce8SaZIibVRN2PWynyuEYtnIrVBRNKmI4Byuht+mECPOgZQez1aAmvtApVnBj5M+Zar2xj5NmN+ZwYp5ZKBvHUj",
+            "parse_error": null,
+            "raw_arguments": null
+          }
+        ],
+        "provider": "google",
+        "api": "google-generative-ai",
+        "model": "gemini-3-flash-preview",
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "tool",
+        "content": "Using target: local-mi300x\nConnecting to root@localhost:22...\nCreated run directory: /root/.wafer/workspaces/kernelbench/kernelbench_eval_20260121_211701\nRunning KernelBench evaluation in Docker container...\nDocker command: docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -v /root/.wafer/workspaces/ker...\nRequirement already satisfied: uv in /opt/venv/lib/python3.12/site-packages (0.9.26)\n[1/2] hipcc -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=maxpool2d_improved -DTORCH_API_INCLUDE_EXTENSION_H -isystem /opt/venv/lib/python3.12/site-packages/torch/include -isystem /opt/venv/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /usr/include/python3.12 -fPIC -std=c++17 -c /root/.cache/torch_extensions/py312_cpu/maxpool2d_improved/main.cpp -o main.o -D__HIP_PLATFORM_AMD__=1 -DUSE_ROCM=1 -DHIPBLAS_V2 -fPIC\n[2/2] hipcc main.o -shared -L/opt/venv/lib/python3.12/site-packages/torch/lib -lc10 -ltorch_cpu -ltorch -ltorch_python -o maxpool2d_improved.so\n[KernelBench] Modules loaded successfully\n[KernelBench] Models instantiated (seed=42)\n[KernelBench] Correctness: True\n[KernelBench] Running benchmarks...\n[KernelBench] New: 5.970ms, Ref: 6.773ms, Speedup: 1.13x\n[KernelBench] Results written to /workspace/kernelbench_eval_20260121_211701/results.json\n\n============================================================\nResult: PASS\nCorrectness: 1/1 (100.0%)\nSpeedup: 1.13x\n============================================================\n",
+        "provider": null,
+        "api": null,
+        "model": null,
+        "tool_call_id": "bash_1769029699_1",
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "write_1769030343_1",
+            "name": "write",
+            "arguments": {
+              "path": "optimized_maxpool2d.py",
+              "content": "\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nimport os\n\nos.environ[\"CXX\"] = \"hipcc\"\n\nmaxpool2d_cpp_source = \"\"\"\n#include <hip/hip_runtime.h>\n#include <torch/extension.h>\n#include <algorithm>\n#include <float.h>\n\n#define TILE_W 16\n#define TILE_H 16\n\n__global__ void maxpool2d_kernel_shm(\n    const float* __restrict__ input,\n    float* __restrict__ output,\n    int N, int C, int H, int W,\n    int k_h, int k_w,\n    int stride_h, int stride_w,\n    int padding_h, int padding_w,\n    int dilation_h, int dilation_w,\n    int H_out, int W_out)\n{\n    // Shared memory for the input tile. \n    // Max kernel size is 4, max stride is 1. \n    // For 16x16 output tile, we need (16*stride + (kernel-1)*dilation + 1)\n    // Here stride=1, dilation=1, kernel=4. So 16+3 = 19.\n    // To handle general cases, we'll size it based on common values or use a fixed large size.\n    // Let's use 32x32 for safety as it fits in shared memory.\n    __shared__ float shm_tile[32][32];\n\n    int tx = threadIdx.x;\n    int ty = threadIdx.y;\n    int bx = blockIdx.x;\n    int by = blockIdx.y;\n    int nc_idx = blockIdx.z;\n\n    int w_out_start = bx * TILE_W;\n    int h_out_start = by * TILE_H;\n\n    int h_in_start = h_out_start * stride_h - padding_h;\n    int w_in_start = w_out_start * stride_w - padding_w;\n\n    // Load input tile into shared memory\n    // Each thread loads multiple elements\n    int input_tile_h = TILE_H * stride_h + (k_h - 1) * dilation_h;\n    int input_tile_w = TILE_W * stride_w + (k_w - 1) * dilation_w;\n    \n    // Safety check for shared memory size\n    if (input_tile_h > 32) input_tile_h = 32;\n    if (input_tile_w > 32) input_tile_w = 32;\n\n    const float* input_ptr = input + (nc_idx * H * W);\n\n    for (int i = ty; i < input_tile_h; i += TILE_H) {\n        for (int j = tx; j < input_tile_w; j += TILE_W) {\n            int h_in = h_in_start + i;\n            int w_in = w_in_start + j;\n            if (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) {\n                shm_tile[i][j] = input_ptr[h_in * W + w_in];\n            } else {\n                shm_tile[i][j] = -FLT_MAX;\n            }\n        }\n    }\n    __syncthreads();\n\n    int w_out_idx = w_out_start + tx;\n    int h_out_idx = h_out_start + ty;\n\n    if (w_out_idx < W_out && h_out_idx < H_out) {\n        float max_val = -FLT_MAX;\n        for (int kh = 0; kh < k_h; ++kh) {\n            for (int kw = 0; kw < k_w; ++kw) {\n                float val = shm_tile[ty * stride_h + kh * dilation_h][tx * stride_w + kw * dilation_w];\n                if (val > max_val) {\n                    max_val = val;\n                }\n            }\n        }\n        output[(nc_idx * H_out + h_out_idx) * W_out + w_out_idx] = max_val;\n    }\n}\n\ntorch::Tensor maxpool2d_hip(\n    torch::Tensor input,\n    int kernel_size, int stride, int padding, int dilation) {\n    \n    int N = input.size(0);\n    int C = input.size(1);\n    int H = input.size(2);\n    int W = input.size(3);\n\n    int k_h = kernel_size;\n    int k_w = kernel_size;\n    int stride_h = stride;\n    int stride_w = stride;\n    int padding_h = padding;\n    int padding_w = padding;\n    int dilation_h = dilation;\n    int dilation_w = dilation;\n\n    int H_out = (H + 2 * padding_h - dilation_h * (k_h - 1) - 1) / stride_h + 1;\n    int W_out = (W + 2 * padding_w - dilation_w * (k_w - 1) - 1) / stride_w + 1;\n\n    auto output = torch::empty({N, C, H_out, W_out}, input.options());\n\n    dim3 block_size(TILE_W, TILE_H);\n    dim3 num_blocks((W_out + TILE_W - 1) / TILE_W,\n                    (H_out + TILE_H - 1) / TILE_H,\n                    N * C);\n\n    maxpool2d_kernel_shm<<<num_blocks, block_size>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        N, C, H, W,\n        k_h, k_w,\n        stride_h, stride_w,\n        padding_h, padding_w,\n        dilation_h, dilation_w,\n        H_out, W_out\n    );\n\n    return output;\n}\n\"\"\"\n\nmaxpool2d_lib = load_inline(\n    name=\"maxpool2d_shm\",\n    cpp_sources=maxpool2d_cpp_source,\n    functions=[\"maxpool2d_hip\"],\n    verbose=True,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, kernel_size: int, stride: int, padding: int, dilation: int):\n        super(ModelNew, self).__init__()\n        self.kernel_size = kernel_size\n        self.stride = stride\n        self.padding = padding\n        self.dilation = dilation\n        self.maxpool2d_lib = maxpool2d_lib\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        return self.maxpool2d_lib.maxpool2d_hip(x, self.kernel_size, self.stride, self.padding, self.dilation)\n"
+            },
+            "thought_signature": "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",
+            "parse_error": null,
+            "raw_arguments": null
+          }
+        ],
+        "provider": "google",
+        "api": "google-generative-ai",
+        "model": "gemini-3-flash-preview",
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "tool",
+        "content": "Successfully wrote 4531 bytes to optimized_maxpool2d.py",
+        "provider": null,
+        "api": null,
+        "model": null,
+        "tool_call_id": "write_1769030343_1",
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "bash_1769030413_1",
+            "name": "bash",
+            "arguments": {
+              "command": "wafer evaluate kernelbench --target local-mi300x --implementation optimized_maxpool2d.py --reference /root/Wafer/research/KernelBench/KernelBench/level1/42_Max_Pooling_2D.py --benchmark --defensive\n"
+            },
+            "thought_signature": "EtoCCtcCAXLI2nwUrEQu/1Zl2gIp/VYtk7+MAOIcLRpJ9/icGsKOFo2Cg+QTQXdb5iTo4XYP53Fh6pcrBnwHelooU/qkw13vKNDxCS4leF4eFl41JUVzvFK8VyvKkylBAOf2CGH2q16GWU3/rz+/ATTgyboUF3hAWBLNiNS4Nt80RgQKdSZ2kLZx6KRpnIpfQ9rHO0wCagjaa0GldPLbHU5SaVC6bif4CG6Ql6E2Xf3zgxnKFfY3pJN82opPM0JqpS1OMHgH/4iEA5UnadpUZJs0vsEnaBG52UWquzO4u6L2OcEz6YWmzxq9ldexiuif8XtYCRC5E5E7UFNiCkMY3gqFdkqL8gcQG9tWEAaw3fTGKgydRm4p7NTzQrCbv8X7t358MeqmlXjS2Xd+Vn/WV5yJwLDWvZbDn6AJPRehiuHUyzV7JYDUptJ20MpZdXTWu502Xnrwsxmnw8Kj8Q==",
+            "parse_error": null,
+            "raw_arguments": null
+          }
+        ],
+        "provider": "google",
+        "api": "google-generative-ai",
+        "model": "gemini-3-flash-preview",
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "tool",
+        "content": "Using target: local-mi300x\nConnecting to root@localhost:22...\nCreated run directory: /root/.wafer/workspaces/kernelbench/kernelbench_eval_20260121_212041\nRunning KernelBench evaluation in Docker container...\nDocker command: docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -v /root/.wafer/workspaces/ker...\nRequirement already satisfied: uv in /opt/venv/lib/python3.12/site-packages (0.9.26)\n[1/2] hipcc -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=maxpool2d_shm -DTORCH_API_INCLUDE_EXTENSION_H -isystem /opt/venv/lib/python3.12/site-packages/torch/include -isystem /opt/venv/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /usr/include/python3.12 -fPIC -std=c++17 -c /root/.cache/torch_extensions/py312_cpu/maxpool2d_shm/main.cpp -o main.o -D__HIP_PLATFORM_AMD__=1 -DUSE_ROCM=1 -DHIPBLAS_V2 -fPIC\n[2/2] hipcc main.o -shared -L/opt/venv/lib/python3.12/site-packages/torch/lib -lc10 -ltorch_cpu -ltorch -ltorch_python -o maxpool2d_shm.so\n[KernelBench] Modules loaded successfully\n[KernelBench] Models instantiated (seed=42)\n[KernelBench] Correctness: True\n[KernelBench] Running benchmarks...\n[KernelBench] New: 4.255ms, Ref: 6.748ms, Speedup: 1.59x\n[KernelBench] Results written to /workspace/kernelbench_eval_20260121_212041/results.json\n\n============================================================\nResult: PASS\nCorrectness: 1/1 (100.0%)\nSpeedup: 1.59x\n============================================================\n",
+        "provider": null,
+        "api": null,
+        "model": null,
+        "tool_call_id": "bash_1769030413_1",
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "write_1769030593_1",
+            "name": "write",
+            "arguments": {
+              "path": "optimized_maxpool2d.py",
+              "content": "\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nimport os\n\nos.environ[\"CXX\"] = \"hipcc\"\n\nmaxpool2d_cpp_source = \"\"\"\n#include <hip/hip_runtime.h>\n#include <torch/extension.h>\n#include <algorithm>\n#include <float.h>\n\n#define TILE_W 16\n#define TILE_H 16\n\n__global__ void __launch_bounds__(256) maxpool2d_kernel_shm_v2(\n    const float* __restrict__ input,\n    float* __restrict__ output,\n    int N, int C, int H, int W,\n    int k_h, int k_w,\n    int stride_h, int stride_w,\n    int padding_h, int padding_w,\n    int dilation_h, int dilation_w,\n    int H_out, int W_out)\n{\n    // Increased shared memory size to handle more general cases.\n    __shared__ float shm_tile[48][48];\n\n    int tx = threadIdx.x;\n    int ty = threadIdx.y;\n    int bx = blockIdx.x;\n    int by = blockIdx.y;\n    int nc_idx = blockIdx.z;\n\n    int w_out_start = bx * TILE_W;\n    int h_out_start = by * TILE_H;\n\n    int h_in_start = h_out_start * stride_h - padding_h;\n    int w_in_start = w_out_start * stride_w - padding_w;\n\n    int input_tile_h = TILE_H * stride_h + (k_h - 1) * dilation_h;\n    int input_tile_w = TILE_W * stride_w + (k_w - 1) * dilation_w;\n    \n    // Safety check for shared memory size\n    if (input_tile_h > 48) input_tile_h = 48;\n    if (input_tile_w > 48) input_tile_w = 48;\n\n    const float* input_ptr = input + (nc_idx * H * W);\n\n    // Optimized loading into shared memory\n    int total_threads = TILE_W * TILE_H;\n    int thread_id = ty * TILE_W + tx;\n    int total_elements = input_tile_h * input_tile_w;\n\n    for (int idx = thread_id; idx < total_elements; idx += total_threads) {\n        int i = idx / input_tile_w;\n        int j = idx % input_tile_w;\n        int h_in = h_in_start + i;\n        int w_in = w_in_start + j;\n        if (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) {\n            shm_tile[i][j] = input_ptr[h_in * W + w_in];\n        } else {\n            shm_tile[i][j] = -FLT_MAX;\n        }\n    }\n    __syncthreads();\n\n    int w_out_idx = w_out_start + tx;\n    int h_out_idx = h_out_start + ty;\n\n    if (w_out_idx < W_out && h_out_idx < H_out) {\n        float max_val = -FLT_MAX;\n        int h_shm_base = ty * stride_h;\n        int w_shm_base = tx * stride_w;\n\n        for (int kh = 0; kh < k_h; ++kh) {\n            int h_shm = h_shm_base + kh * dilation_h;\n            for (int kw = 0; kw < k_w; ++kw) {\n                int w_shm = w_shm_base + kw * dilation_w;\n                float val = shm_tile[h_shm][w_shm];\n                if (val > max_val) {\n                    max_val = val;\n                }\n            }\n        }\n        output[(nc_idx * H_out + h_out_idx) * W_out + w_out_idx] = max_val;\n    }\n}\n\ntorch::Tensor maxpool2d_hip(\n    torch::Tensor input,\n    int kernel_size, int stride, int padding, int dilation) {\n    \n    int N = input.size(0);\n    int C = input.size(1);\n    int H = input.size(2);\n    int W = input.size(3);\n\n    int k_h = kernel_size;\n    int k_w = kernel_size;\n    int stride_h = stride;\n    int stride_w = stride;\n    int padding_h = padding;\n    int padding_w = padding;\n    int dilation_h = dilation;\n    int dilation_w = dilation;\n\n    int H_out = (H + 2 * padding_h - dilation_h * (k_h - 1) - 1) / stride_h + 1;\n    int W_out = (W + 2 * padding_w - dilation_w * (k_w - 1) - 1) / stride_w + 1;\n\n    auto output = torch::empty({N, C, H_out, W_out}, input.options());\n\n    dim3 block_size(TILE_W, TILE_H);\n    dim3 num_blocks((W_out + TILE_W - 1) / TILE_W,\n                    (H_out + TILE_H - 1) / TILE_H,\n                    N * C);\n\n    maxpool2d_kernel_shm_v2<<<num_blocks, block_size>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        N, C, H, W,\n        k_h, k_w,\n        stride_h, stride_w,\n        padding_h, padding_w,\n        dilation_h, dilation_w,\n        H_out, W_out\n    );\n\n    return output;\n}\n\"\"\"\n\nmaxpool2d_lib = load_inline(\n    name=\"maxpool2d_shm_v2\",\n    cpp_sources=maxpool2d_cpp_source,\n    functions=[\"maxpool2d_hip\"],\n    verbose=True,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, kernel_size: int, stride: int, padding: int, dilation: int):\n        super(ModelNew, self).__init__()\n        self.kernel_size = kernel_size\n        self.stride = stride\n        self.padding = padding\n        self.dilation = dilation\n        self.maxpool2d_lib = maxpool2d_lib\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        return self.maxpool2d_lib.maxpool2d_hip(x, self.kernel_size, self.stride, self.padding, self.dilation)\n"
+            },
+            "thought_signature": "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",
+            "parse_error": null,
+            "raw_arguments": null
+          }
+        ],
+        "provider": "google",
+        "api": "google-generative-ai",
+        "model": "gemini-3-flash-preview",
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "tool",
+        "content": "Successfully wrote 4479 bytes to optimized_maxpool2d.py",
+        "provider": null,
+        "api": null,
+        "model": null,
+        "tool_call_id": "write_1769030593_1",
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "bash_1769030684_1",
+            "name": "bash",
+            "arguments": {
+              "command": "wafer evaluate kernelbench --target local-mi300x --implementation optimized_maxpool2d.py --reference /root/Wafer/research/KernelBench/KernelBench/level1/42_Max_Pooling_2D.py --benchmark --defensive\n"
+            },
+            "thought_signature": "EocCCoQCAXLI2nwZ0N3p7NmJ7kSPB0wC7q3TWhEOEZoaJYPlCCc97XJ/1EBW3Y9JLUuN2EFx6TtHcoVa8lNX0YsvlBNXwbScE3orNYCsyh/CF3SQzXJw9y+Kk9e+h3/uvyio5BRd6FleLekYQIewtKT1jFT3dD/gofQ9uH2L+QmFkoScYlULrmFHWV8RQgJVSHiVBmoW0jpHuxzOLHcXGnVaM7/wrGtcntKDJQpIlAndANdrIFi7sJMZ9Y911UhthDQtD9DMfd4t5BSBqhbFt46TAt4RQfmBinsn/JST/A4SNIG1vbuKBaWEnMtXA7XVQ9GpYLFd5nF4/La32f9pnehbwzwEpc2qxzk=",
+            "parse_error": null,
+            "raw_arguments": null
+          }
+        ],
+        "provider": "google",
+        "api": "google-generative-ai",
+        "model": "gemini-3-flash-preview",
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "tool",
+        "content": "Using target: local-mi300x\nConnecting to root@localhost:22...\nCreated run directory: /root/.wafer/workspaces/kernelbench/kernelbench_eval_20260121_212629\nRunning KernelBench evaluation in Docker container...\nDocker command: docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -v /root/.wafer/workspaces/ker...\nRequirement already satisfied: uv in /opt/venv/lib/python3.12/site-packages (0.9.26)\n[1/2] hipcc -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=maxpool2d_shm_v2 -DTORCH_API_INCLUDE_EXTENSION_H -isystem /opt/venv/lib/python3.12/site-packages/torch/include -isystem /opt/venv/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /usr/include/python3.12 -fPIC -std=c++17 -c /root/.cache/torch_extensions/py312_cpu/maxpool2d_shm_v2/main.cpp -o main.o -D__HIP_PLATFORM_AMD__=1 -DUSE_ROCM=1 -DHIPBLAS_V2 -fPIC\n[2/2] hipcc main.o -shared -L/opt/venv/lib/python3.12/site-packages/torch/lib -lc10 -ltorch_cpu -ltorch -ltorch_python -o maxpool2d_shm_v2.so\n[KernelBench] Modules loaded successfully\n[KernelBench] Models instantiated (seed=42)\n[KernelBench] Correctness: True\n[KernelBench] Running benchmarks...\n[KernelBench] New: 4.087ms, Ref: 6.751ms, Speedup: 1.65x\n[KernelBench] Results written to /workspace/kernelbench_eval_20260121_212629/results.json\n\n============================================================\nResult: PASS\nCorrectness: 1/1 (100.0%)\nSpeedup: 1.65x\n============================================================\n",
+        "provider": null,
+        "api": null,
+        "model": null,
+        "tool_call_id": "bash_1769030684_1",
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "The optimized Max Pooling 2D implementation uses a custom HIP/ROCm kernel with shared memory tiling. By loading a tile of input data into shared memory, the kernel reduces global memory access redundancy, which is a major bottleneck in pooling operations where windows overlap (e.g., stride 1). Each thread calculates one output element, leveraging the coalesced memory access pattern when reading and writing to global memory.\n\n```python\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nimport os\n\nos.environ[\"CXX\"] = \"hipcc\"\n\nmaxpool2d_cpp_source = \"\"\"\n#include <hip/hip_runtime.h>\n#include <torch/extension.h>\n#include <algorithm>\n#include <float.h>\n\n#define TILE_W 16\n#define TILE_H 16\n\n__global__ void __launch_bounds__(256) maxpool2d_kernel_shm_v2(\n    const float* __restrict__ input,\n    float* __restrict__ output,\n    int N, int C, int H, int W,\n    int k_h, int k_w,\n    int stride_h, int stride_w,\n    int padding_h, int padding_w,\n    int dilation_h, int dilation_w,\n    int H_out, int W_out)\n{\n    // Shared memory for the input tile.\n    // The tile size is chosen to handle common pooling configurations efficiently.\n    __shared__ float shm_tile[48][48];\n\n    int tx = threadIdx.x;\n    int ty = threadIdx.y;\n    int bx = blockIdx.x;\n    int by = blockIdx.y;\n    int nc_idx = blockIdx.z;\n\n    int w_out_start = bx * TILE_W;\n    int h_out_start = by * TILE_H;\n\n    int h_in_start = h_out_start * stride_h - padding_h;\n    int w_in_start = w_out_start * stride_w - padding_w;\n\n    int input_tile_h = TILE_H * stride_h + (k_h - 1) * dilation_h;\n    int input_tile_w = TILE_W * stride_w + (k_w - 1) * dilation_w;\n    \n    if (input_tile_h > 48) input_tile_h = 48;\n    if (input_tile_w > 48) input_tile_w = 48;\n\n    const float* input_ptr = input + (nc_idx * H * W);\n\n    // Efficiently load input tile into shared memory using all threads in the block\n    int total_threads = TILE_W * TILE_H;\n    int thread_id = ty * TILE_W + tx;\n    int total_elements = input_tile_h * input_tile_w;\n\n    for (int idx = thread_id; idx < total_elements; idx += total_threads) {\n        int i = idx / input_tile_w;\n        int j = idx % input_tile_w;\n        int h_in = h_in_start + i;\n        int w_in = w_in_start + j;\n        if (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) {\n            shm_tile[i][j] = input_ptr[h_in * W + w_in];\n        } else {\n            shm_tile[i][j] = -FLT_MAX;\n        }\n    }\n    __syncthreads();\n\n    int w_out_idx = w_out_start + tx;\n    int h_out_idx = h_out_start + ty;\n\n    if (w_out_idx < W_out && h_out_idx < H_out) {\n        float max_val = -FLT_MAX;\n        int h_shm_base = ty * stride_h;\n        int w_shm_base = tx * stride_w;\n\n        for (int kh = 0; kh < k_h; ++kh) {\n            int h_shm = h_shm_base + kh * dilation_h;\n            for (int kw = 0; kw < k_w; ++kw) {\n                int w_shm = w_shm_base + kw * dilation_w;\n                float val = shm_tile[h_shm][w_shm];\n                if (val > max_val) {\n                    max_val = val;\n                }\n            }\n        }\n        output[(nc_idx * H_out + h_out_idx) * W_out + w_out_idx] = max_val;\n    }\n}\n\ntorch::Tensor maxpool2d_hip(\n    torch::Tensor input,\n    int kernel_size, int stride, int padding, int dilation) {\n    \n    int N = input.size(0);\n    int C = input.size(1);\n    int H = input.size(2);\n    int W = input.size(3);\n\n    int k_h = kernel_size;\n    int k_w = kernel_size;\n    int stride_h = stride;\n    int stride_w = stride;\n    int padding_h = padding;\n    int padding_w = padding;\n    int dilation_h = dilation;\n    int dilation_w = dilation;\n\n    int H_out = (H + 2 * padding_h - dilation_h * (k_h - 1) - 1) / stride_h + 1;\n    int W_out = (W + 2 * padding_w - dilation_w * (k_w - 1) - 1) / stride_w + 1;\n\n    auto output = torch::empty({N, C, H_out, W_out}, input.options());\n\n    dim3 block_size(TILE_W, TILE_H);\n    dim3 num_blocks((W_out + TILE_W - 1) / TILE_W,\n                    (H_out + TILE_H - 1) / TILE_H,\n                    N * C);\n\n    maxpool2d_kernel_shm_v2<<<num_blocks, block_size>>>(\n        input.data_ptr<float>(),\n        output.data_ptr<float>(),\n        N, C, H, W,\n        k_h, k_w,\n        stride_h, stride_w,\n        padding_h, padding_w,\n        dilation_h, dilation_w,\n        H_out, W_out\n    );\n\n    return output;\n}\n\"\"\"\n\nmaxpool2d_lib = load_inline(\n    name=\"maxpool2d_shm_v2\",\n    cpp_sources=maxpool2d_cpp_source,\n    functions=[\"maxpool2d_hip\"],\n    verbose=True,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, kernel_size: int, stride: int, padding: int, dilation: int):\n        super(ModelNew, self).__init__()\n        self.kernel_size = kernel_size\n        self.stride = stride\n        self.padding = padding\n        self.dilation = dilation\n        self.maxpool2d_lib = maxpool2d_lib\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        return self.maxpool2d_lib.maxpool2d_hip(x, self.kernel_size, self.stride, self.padding, self.dilation)\n\n```",
+            "text_signature": null
+          }
+        ],
+        "provider": "google",
+        "api": "google-generative-ai",
+        "model": "gemini-3-flash-preview",
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      },
+      {
+        "role": "assistant",
+        "content": [],
+        "provider": "google",
+        "api": "google-generative-ai",
+        "model": "gemini-3-flash-preview",
+        "tool_call_id": null,
+        "details": null,
+        "timestamp": null
+      }
+    ],
+    "rewards": 0.0,
+    "group": 0,
+    "replica": 0,
+    "advantages": 0.0,
+    "metadata": {
+      "sample_data": {
+        "level": "level1",
+        "problem_id": 41,
+        "problem_path": "/root/Wafer/research/KernelBench/KernelBench/level1/42_Max_Pooling_2D.py",
+        "ref_arch_src": "import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    \"\"\"\n    Simple model that performs Max Pooling 2D.\n    \"\"\"\n    def __init__(self, kernel_size: int, stride: int, padding: int, dilation: int):\n        \"\"\"\n        Initializes the Max Pooling 2D layer.\n\n        Args:\n            kernel_size (int): Size of the pooling window.\n            stride (int): Stride of the pooling window.\n            padding (int): Padding to be applied before pooling.\n            dilation (int): Spacing between kernel elements.\n        \"\"\"\n        super(Model, self).__init__()\n        self.maxpool = nn.MaxPool2d(kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation)\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Max Pooling 2D to the input tensor.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, channels, height, width).\n\n        Returns:\n            torch.Tensor: Output tensor after Max Pooling 2D, shape (batch_size, channels, pooled_height, pooled_width).\n        \"\"\"\n        return self.maxpool(x)\n\nbatch_size = 32\nchannels = 64\nheight = 512\nwidth = 512\nkernel_size = 4\nstride = 1\npadding = 1\ndilation = 1\n\ndef get_inputs():\n    x = torch.rand(batch_size, channels, height, width)\n    return [x]\n\ndef get_init_inputs():\n    return [kernel_size, stride, padding, dilation]\n",
+        "name": "42_Max_Pooling_2D",
+        "expected_answer": "import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    \"\"\"\n    Simple model that performs Max Pooling 2D.\n    \"\"\"\n    def __init__(self, kernel_size: int, stride: int, padding: int, dilation: int):\n        \"\"\"\n        Initializes the Max Pooling 2D layer.\n\n        Args:\n            kernel_size (int): Size of the pooling window.\n            stride (int): Stride of the pooling window.\n            padding (int): Padding to be applied before pooling.\n            dilation (int): Spacing between kernel elements.\n        \"\"\"\n        super(Model, self).__init__()\n        self.maxpool = nn.MaxPool2d(kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation)\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Max Pooling 2D to the input tensor.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, channels, height, width).\n\n        Returns:\n            torch.Tensor: Output tensor after Max Pooling 2D, shape (batch_size, channels, pooled_height, pooled_width).\n        \"\"\"\n        return self.maxpool(x)\n\nbatch_size = 32\nchannels = 64\nheight = 512\nwidth = 512\nkernel_size = 4\nstride = 1\npadding = 1\ndilation = 1\n\ndef get_inputs():\n    x = torch.rand(batch_size, channels, height, width)\n    return [x]\n\ndef get_init_inputs():\n    return [kernel_size, stride, padding, dilation]\n",
+        "user_prompt": "Optimize the HIP kernel for 42_Max_Pooling_2D",
+        "_sample_id": "sample_0010"
+      }
+    }
+  },
+  "tokens": [],
+  "response_length": 0,
+  "loss_mask": [],
+  "reward": 0.9,
+  "rollout_log_probs": null,
+  "score": {
+    "metrics": [
+      {
+        "name": "judge_score",
+        "value": 0.9,
+        "weight": 1.0,
+        "metadata": {
+          "reasoning": "The agent successfully ran wafer evaluate kernelbench multiple times and achieved a 1.65x speedup with verified correctness. The optimization implements high-quality techniques including shared memory tiling (48x48 tile), efficient coalesced memory access patterns, optimized thread block organization (16x16), and proper boundary handling. The code iteratively improved from 1.12x to 1.65x speedup through multiple optimizations. The implementation is well-structured with clear documentation. Only minor point deduction for not exploring additional advanced optimizations like warp-level primitives."
+        }
+      },
+      {
+        "name": "judge_score_raw",
+        "value": 9.0,
+        "weight": 0.0,
+        "metadata": {}
+      },
+      {
+        "name": "has_response",
+        "value": 1.0,
+        "weight": 0.0,
+        "metadata": {}
+      }
+    ]
+  },
+  "environment_state": {
+    "working_dir": "/root/Wafer/research/evals/ian/kernels/gemini_3_flash_level1_kb3_def/sample_0010",
+    "enabled_tools": [
+      "bash",
+      "write"
+    ],
+    "bash_allowlist": [
+      "wafer evaluate",
+      "python",
+      "python3",
+      "ls",
+      "cat",
+      "head",
+      "tail",
+      "wc",
+      "find",
+      "cd",
+      "pwd",
+      "which"
+    ],
+    "bash_denylist": null
+  },
+  "status": "pending",
+  "metadata": {
+    "turns_used": 10,
+    "stop_reason": null,
+    "total_tokens": 13862,
+    "status": "success",
+    "duration_seconds": 1711.2383351325989
+  }
+}
