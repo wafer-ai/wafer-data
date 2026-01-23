@@ -7,190 +7,221 @@ import os
 
 os.environ["CXX"] = "hipcc"
 
-fused_kernels_cpp_source = """
+# HIP kernel source
+hip_source = """
 #include <hip/hip_runtime.h>
 #include <torch/extension.h>
-#include <cmath>
+#include <math.h>
 
-__global__ void mean_var_kernel_optimized(
-    const float4* __restrict__ input_vec,
+__global__ void compute_mean_var_kernel(
+    const float* __restrict__ input,
     float* __restrict__ mean,
     float* __restrict__ inv_std,
-    int N, int G, int elements_per_group_v4, float inv_elements, float eps) {
-    
-    int ng = blockIdx.x;
-    if (ng >= N * G) return;
-    
-    const float4* group_input_v4 = input_vec + ng * elements_per_group_v4;
-    
-    float sum = 0.0f;
-    float sum_sq = 0.0f;
-    
-    #pragma unroll 4
-    for (int i = threadIdx.x; i < elements_per_group_v4; i += blockDim.x) {
-        float4 val = group_input_v4[i];
-        sum += val.x + val.y + val.z + val.w;
-        sum_sq += val.x * val.x + val.y * val.y + val.z * val.z + val.w * val.w;
+    int batch_size,
+    int num_groups,
+    int channels_per_group,
+    int height,
+    int width,
+    float eps) {
+
+    int b = blockIdx.y;
+    int g = blockIdx.x;
+
+    if (b >= batch_size || g >= num_groups) return;
+
+    int num_elements = channels_per_group * height * width;
+    double sum = 0.0;
+    double sum_sq = 0.0;
+
+    int group_offset = (b * num_groups + g) * num_elements;
+
+    for (int i = threadIdx.x; i < num_elements; i += blockDim.x) {
+        float val = input[group_offset + i];
+        sum += (double)val;
+        sum_sq += (double)val * val;
     }
-    
-    __shared__ float s_sum[32];
-    __shared__ float s_sum_sq[32];
-    
-    float warp_sum = sum;
-    float warp_sum_sq = sum_sq;
-    for (int offset = 16; offset > 0; offset /= 2) {
-        warp_sum += __shfl_down(warp_sum, offset);
-        warp_sum_sq += __shfl_down(warp_sum_sq, offset);
-    }
-    
-    if (threadIdx.x % 32 == 0) {
-        s_sum[threadIdx.x / 32] = warp_sum;
-        s_sum_sq[threadIdx.x / 32] = warp_sum_sq;
-    }
+
+    // Using block reduction
+    extern __shared__ double shared_mem[];
+    double* s_sum = shared_mem;
+    double* s_sum_sq = &shared_mem[blockDim.x];
+
+    s_sum[threadIdx.x] = sum;
+    s_sum_sq[threadIdx.x] = sum_sq;
     __syncthreads();
-    
-    if (threadIdx.x < 32) {
-        float final_sum = (threadIdx.x < blockDim.x / 32) ? s_sum[threadIdx.x] : 0.0f;
-        float final_sum_sq = (threadIdx.x < blockDim.x / 32) ? s_sum_sq[threadIdx.x] : 0.0f;
-        
-        for (int offset = 16; offset > 0; offset /= 2) {
-            final_sum += __shfl_down(final_sum, offset);
-            final_sum_sq += __shfl_down(final_sum_sq, offset);
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            s_sum[threadIdx.x] += s_sum[threadIdx.x + s];
+            s_sum_sq[threadIdx.x] += s_sum_sq[threadIdx.x + s];
         }
-        
-        if (threadIdx.x == 0) {
-            float m = final_sum * inv_elements;
-            float var = (final_sum_sq * inv_elements) - (m * m);
-            mean[ng] = m;
-            inv_std[ng] = rsqrtf(fmaxf(var, 0.0f) + eps);
-        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        double m = s_sum[0] / num_elements;
+        double v = (s_sum_sq[0] / num_elements) - (m * m);
+        if (v < 0) v = 0;
+        mean[b * num_groups + g] = (float)m;
+        inv_std[b * num_groups + g] = (float)(1.0 / sqrt(v + (double)eps));
     }
 }
 
-__global__ void fused_gn_scale_maxpool_clamp_kernel_optimized(
+__global__ void fused_gn_scale_maxpool_clamp_kernel(
     const float* __restrict__ input,
     const float* __restrict__ mean,
     const float* __restrict__ inv_std,
-    const float* __restrict__ gn_weight,
-    const float* __restrict__ gn_bias,
-    const float* __restrict__ scale,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    const float* __restrict__ extra_scale,
     float* __restrict__ output,
-    int N, int C, int G, int H, int W,
-    int H_pool, int W_pool, int pool_size,
-    float clamp_min, float clamp_max) {
-    
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_elements = N * C * H_pool * W_pool;
-    if (idx >= total_elements) return;
-    
-    int pw = idx % W_pool;
-    int ph = (idx / W_pool) % H_pool;
-    int c = (idx / (W_pool * H_pool)) % C;
-    int n = idx / (W_pool * H_pool * C);
-    
-    int g = c / (C / G);
-    int ng = n * G + g;
-    
-    float m = mean[ng];
-    float istd = inv_std[ng];
-    float w = gn_weight[c];
-    float b = gn_bias[c];
-    float s = scale[c];
-    
-    float eff_w = istd * w * s;
-    float eff_b = (b - m * istd * w) * s;
-    
-    float max_val = -1e38f;
-    
-    int h_start = ph * pool_size;
-    int w_start = pw * pool_size;
-    
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) { // pool_size is 4
-        int h = h_start + i;
-        const float* in_row = input + ((n * C + c) * H + h) * W + w_start;
-        #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            float val = in_row[j];
-            val = val * eff_w + eff_b;
-            if (val > max_val) max_val = val;
-        }
-    }
-    
-    max_val = fminf(fmaxf(max_val, clamp_min), clamp_max);
-    output[idx] = max_val;
-}
-
-torch::Tensor fused_op_hip(
-    torch::Tensor x,
-    torch::Tensor mean,
-    torch::Tensor inv_std,
-    torch::Tensor gn_weight,
-    torch::Tensor gn_bias,
-    torch::Tensor scale,
+    int batch_size,
     int num_groups,
-    int pool_size,
+    int channels_per_group,
+    int input_h,
+    int input_w,
+    int output_h,
+    int output_w,
+    int pool_k,
     float clamp_min,
     float clamp_max) {
-    
-    int N = x.size(0);
-    int C = x.size(1);
-    int H = x.size(2);
-    int W = x.size(3);
-    
-    int H_pool = H / pool_size;
-    int W_pool = W / pool_size;
-    
-    auto output = torch::empty({N, C, H_pool, W_pool}, x.options());
-    int total_elements = N * C * H_pool * W_pool;
-    int block_size = 256;
-    int num_blocks = (total_elements + block_size - 1) / block_size;
-    
-    fused_gn_scale_maxpool_clamp_kernel_optimized<<<num_blocks, block_size>>>(
-        x.data_ptr<float>(),
-        mean.data_ptr<float>(),
-        inv_std.data_ptr<float>(),
-        gn_weight.data_ptr<float>(),
-        gn_bias.data_ptr<float>(),
-        scale.data_ptr<float>(),
+
+    int b = blockIdx.z;
+    int c = blockIdx.y;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int oh = idx / output_w;
+    int ow = idx % output_w;
+
+    if (b >= batch_size || c >= (num_groups * channels_per_group) || oh >= output_h) return;
+
+    int g = c / channels_per_group;
+    float m = mean[b * num_groups + g];
+    float is = inv_std[b * num_groups + g];
+    float w = weight[c];
+    float bi = bias[c];
+    float s = extra_scale[c];
+
+    float fused_w = w * is * s;
+    float fused_b = (bi - m * w * is) * s;
+
+    float max_val = -1e38f;
+
+    int ih_start = oh * pool_k;
+    int iw_start = ow * pool_k;
+
+    int channel_offset = (b * (num_groups * channels_per_group) + c) * input_h * input_w;
+
+    for (int kh = 0; kh < pool_k; ++kh) {
+        int ih = ih_start + kh;
+        if (ih < input_h) {
+            int row_offset = channel_offset + ih * input_w;
+            for (int kw = 0; kw < pool_k; ++kw) {
+                int iw = iw_start + kw;
+                if (iw < input_w) {
+                    float val = input[row_offset + iw];
+                    float norm_val = val * fused_w + fused_b;
+                    if (norm_val > max_val) {
+                        max_val = norm_val;
+                    }
+                }
+            }
+        }
+    }
+
+    if (max_val < clamp_min) max_val = clamp_min;
+    if (max_val > clamp_max) max_val = clamp_max;
+
+    output[((b * (num_groups * channels_per_group) + c) * output_h + oh) * output_w + ow] = max_val;
+}
+
+torch::Tensor fused_op(
+    torch::Tensor input,
+    torch::Tensor mean_tensor,
+    torch::Tensor inv_std_tensor,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor extra_scale,
+    int output_h,
+    int output_w,
+    int pool_k,
+    float clamp_min,
+    float clamp_max) {
+
+    int batch_size = input.size(0);
+    int num_channels = input.size(1);
+    int input_h = input.size(2);
+    int input_w = input.size(3);
+    int num_groups = mean_tensor.size(1);
+    int channels_per_group = num_channels / num_groups;
+
+    auto output = torch::empty({batch_size, num_channels, output_h, output_w}, input.options());
+
+    dim3 block(256);
+    dim3 grid((output_h * output_w + 255) / 256, num_channels, batch_size);
+
+    fused_gn_scale_maxpool_clamp_kernel<<<grid, block>>>(
+        input.data_ptr<float>(),
+        mean_tensor.data_ptr<float>(),
+        inv_std_tensor.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        extra_scale.data_ptr<float>(),
         output.data_ptr<float>(),
-        N, C, num_groups, H, W,
-        H_pool, W_pool, pool_size,
-        clamp_min, clamp_max
+        batch_size,
+        num_groups,
+        channels_per_group,
+        input_h,
+        input_w,
+        output_h,
+        output_w,
+        pool_k,
+        clamp_min,
+        clamp_max
     );
-    
+
     return output;
 }
 
-std::vector<torch::Tensor> mean_var_hip(torch::Tensor x, int num_groups, float eps) {
-    int N = x.size(0);
-    int C = x.size(1);
-    int H = x.size(2);
-    int W = x.size(3);
-    int G = num_groups;
-    
-    int elements_per_group = (C / G) * H * W;
-    int elements_per_group_v4 = elements_per_group / 4;
-    float inv_elements = 1.0f / elements_per_group;
-    
-    auto mean = torch::empty({N, G}, x.options());
-    auto inv_std = torch::empty({N, G}, x.options());
-    
-    mean_var_kernel_optimized<<<N * G, 256>>>(
-        (const float4*)x.data_ptr<float>(),
+std::vector<torch::Tensor> compute_mean_var(torch::Tensor input, int num_groups, float eps) {
+    int batch_size = input.size(0);
+    int num_channels = input.size(1);
+    int height = input.size(2);
+    int width = input.size(3);
+    int channels_per_group = num_channels / num_groups;
+
+    auto mean = torch::empty({batch_size, num_groups}, input.options());
+    auto inv_std = torch::empty({batch_size, num_groups}, input.options());
+
+    dim3 block(256);
+    dim3 grid(num_groups, batch_size);
+    size_t shared_mem_size = 2 * block.x * sizeof(double);
+
+    compute_mean_var_kernel<<<grid, block, shared_mem_size>>>(
+        input.data_ptr<float>(),
         mean.data_ptr<float>(),
         inv_std.data_ptr<float>(),
-        N, G, elements_per_group_v4, inv_elements, eps
+        batch_size,
+        num_groups,
+        channels_per_group,
+        height,
+        width,
+        eps
     );
-    
+
     return {mean, inv_std};
 }
 """
 
-fused_ops = load_inline(
-    name="fused_ops_v3",
-    cpp_sources=fused_kernels_cpp_source,
-    functions=["mean_var_hip", "fused_op_hip"],
+fused_lib = load_inline(
+    name="fused_lib",
+    cpp_sources="""
+    #include <torch/extension.h>
+    #include <vector>
+    std::vector<torch::Tensor> compute_mean_var(torch::Tensor input, int num_groups, float eps);
+    torch::Tensor fused_op(torch::Tensor input, torch::Tensor mean_tensor, torch::Tensor inv_std_tensor, torch::Tensor weight, torch::Tensor bias, torch::Tensor extra_scale, int output_h, int output_w, int pool_k, float clamp_min, float clamp_max);
+    """,
+    cuda_sources=hip_source,
+    functions=["compute_mean_var", "fused_op"],
     verbose=True,
 )
 
@@ -207,20 +238,19 @@ class ModelNew(nn.Module):
 
     def forward(self, x):
         x = self.conv(x)
-        mean, inv_std = fused_ops.mean_var_hip(x, self.num_groups, self.group_norm.eps)
-        gn_weight = self.group_norm.weight
-        gn_bias = self.group_norm.bias
-        if gn_weight is None:
-            gn_weight = torch.ones(x.size(1), device=x.device, dtype=x.dtype)
-        if gn_bias is None:
-            gn_bias = torch.zeros(x.size(1), device=x.device, dtype=x.dtype)
-            
-        x = fused_ops.fused_op_hip(
+        
+        input_h, input_w = x.size(2), x.size(3)
+        output_h = (input_h - self.maxpool_kernel_size) // self.maxpool_kernel_size + 1
+        output_w = (input_w - self.maxpool_kernel_size) // self.maxpool_kernel_size + 1
+
+        mean, inv_std = fused_lib.compute_mean_var(x, self.num_groups, self.group_norm.eps)
+        
+        x = fused_lib.fused_op(
             x, mean, inv_std, 
-            gn_weight, gn_bias, 
-            self.scale.view(-1),
-            self.num_groups, self.maxpool_kernel_size,
+            self.group_norm.weight, self.group_norm.bias, self.scale.view(-1),
+            output_h, output_w, self.maxpool_kernel_size,
             self.clamp_min, self.clamp_max
         )
+        
         return x
 

@@ -6,64 +6,63 @@ import os
 
 os.environ["CXX"] = "hipcc"
 
-hipblas_source = """
-#include <hip/hip_runtime.h>
-#include <hipblas/hipblas.h>
+# Optimized Batched Matrix Multiplication using hipBLAS directly from C++
+bmm_cpp_source = """
 #include <torch/extension.h>
-#include <mutex>
+#include <hipblas/hipblas.h>
+#include <hip/hip_runtime.h>
 
-static hipblasHandle_t global_handle = nullptr;
-static std::mutex handle_mutex;
-
-void init_handle() {
-    std::lock_guard<std::mutex> lock(handle_mutex);
-    if (global_handle == nullptr) {
-        hipblasCreate(&global_handle);
+// Handle function to manage hipBLAS handle
+hipblasHandle_t get_hipblas_handle() {
+    static hipblasHandle_t handle = nullptr;
+    if (handle == nullptr) {
+        hipblasCreate(&handle);
     }
+    return handle;
 }
 
-torch::Tensor batched_gemm_hipblas(torch::Tensor A, torch::Tensor B) {
-    if (global_handle == nullptr) {
-        init_handle();
-    }
-    
+torch::Tensor bmm_hip(torch::Tensor A, torch::Tensor B) {
     int batch_size = A.size(0);
-    int m = A.size(1);
-    int k = A.size(2);
-    int n = B.size(2);
-    
-    auto C = torch::empty({batch_size, m, n}, A.options());
-    
+    int M = A.size(1);
+    int K = A.size(2);
+    int N = B.size(2);
+
+    auto C = torch::empty({batch_size, M, N}, A.options());
+
     float alpha = 1.0f;
     float beta = 0.0f;
-    
-    // Column-major SGEMM
-    // We treat row-major A(m, k) as column-major A'(k, m)
-    // We treat row-major B(k, n) as column-major B'(n, k)
-    // We treat row-major C(m, n) as column-major C'(n, m)
-    // Formula: C' = B' * A'
+
+    // Use hipblasSgemmStridedBatched for batched matrix multiplication.
+    // Tensors are row-major in PyTorch (batch, rows, cols).
+    // hipBLAS is column-major.
+    // A(batch, M, K) row-major is A^T(batch, K, M) column-major.
+    // B(batch, K, N) row-major is B^T(batch, N, K) column-major.
+    // C = A * B in row-major is C^T = B^T * A^T in column-major.
+    // So we compute B^T * A^T = C^T
+    // B^T: opN, N rows, K cols
+    // A^T: opN, K rows, M cols
+    // Result C^T: N rows, M cols
     
     hipblasSgemmStridedBatched(
-        global_handle,
+        get_hipblas_handle(),
         HIPBLAS_OP_N, HIPBLAS_OP_N,
-        n, m, k,
+        N, M, K,
         &alpha,
-        B.data_ptr<float>(), n, k * n,
-        A.data_ptr<float>(), k, m * k,
+        B.data_ptr<float>(), N, K * N,
+        A.data_ptr<float>(), K, M * K,
         &beta,
-        C.data_ptr<float>(), n, m * n,
+        C.data_ptr<float>(), N, M * N,
         batch_size
     );
-    
+
     return C;
 }
 """
 
-batched_gemm_lib = load_inline(
-    name="batched_gemm_hipblas_v3",
-    cpp_sources="torch::Tensor batched_gemm_hipblas(torch::Tensor A, torch::Tensor B);",
-    cuda_sources=hipblas_source,
-    functions=["batched_gemm_hipblas"],
+bmm_module = load_inline(
+    name="bmm_module",
+    cpp_sources=bmm_cpp_source,
+    functions=["bmm_hip"],
     extra_ldflags=["-lhipblas"],
     verbose=True,
 )
@@ -71,7 +70,8 @@ batched_gemm_lib = load_inline(
 class ModelNew(nn.Module):
     def __init__(self):
         super(ModelNew, self).__init__()
-        self.batched_gemm = batched_gemm_lib
+        self.bmm_module = bmm_module
 
     def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-        return self.batched_gemm.batched_gemm_hipblas(A, B)
+        # Simple wrapper to handle the calling
+        return self.bmm_module.bmm_hip(A, B)

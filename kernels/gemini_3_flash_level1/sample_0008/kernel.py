@@ -6,66 +6,71 @@ import os
 
 os.environ["CXX"] = "hipcc"
 
-gemm_cpp_source = """
+rms_norm_source = """
 #include <hip/hip_runtime.h>
 #include <torch/extension.h>
+#include <math.h>
 
-__global__ void __launch_bounds__(256)
-gemm_float4_kernel(const float4* __restrict__ A, const float4* __restrict__ B_transposed, float* __restrict__ C,
-                   int M, int N, int K) {
-    // This is a simplified version. A real high-performance GEMM
-    // would be much more complex.
-    // Assuming K and N are multiples of 4.
-    
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void rms_norm_kernel(const float* __restrict__ x, float* __restrict__ out, int N, int C, int H, int W, float eps) {
+    int idx = blockIdx.x * (int)blockDim.x + threadIdx.x;
+    int stride = H * W;
+    int num_nhw = N * stride;
 
-    if (row < M && col < N) {
-        float sum = 0.0f;
-        int K4 = K / 4;
-        for (int k = 0; k < K4; ++k) {
-            float4 a4 = A[row * K4 + k];
-            float4 b4 = B_transposed[col * K4 + k];
-            sum += a4.x * b4.x + a4.y * b4.y + a4.z * b4.z + a4.w * b4.w;
+    if (idx < num_nhw) {
+        int n = idx / stride;
+        int hw_idx = idx % stride;
+        int base_idx = n * (C * stride) + hw_idx;
+
+        float sum_sq = 0.0f;
+        for (int c = 0; c < C; ++c) {
+            float val = x[base_idx + c * stride];
+            sum_sq += val * val;
         }
-        C[row * N + col] = sum;
+        
+        float inv_rms = rsqrtf(sum_sq / (float)C + eps);
+
+        for (int c = 0; c < C; ++c) {
+            out[base_idx + c * stride] = x[base_idx + c * stride] * inv_rms;
+        }
     }
 }
 
-torch::Tensor gemm_hip(torch::Tensor A, torch::Tensor B) {
-    const int batch_size = A.size(0);
-    const int M_dim = A.size(1);
-    const int K = A.size(2);
-    const int N = B.size(1);
-    const int M = batch_size * M_dim;
-
-    auto C = torch::empty({batch_size, M_dim, N}, A.options());
-    auto B_transposed = B.t().contiguous();
-
-    dim3 block(16, 16);
-    dim3 grid((N + 15) / 16, (M + 15) / 16);
-
-    gemm_float4_kernel<<<grid, block>>>(
-        (const float4*)A.data_ptr<float>(),
-        (const float4*)B_transposed.data_ptr<float>(),
-        C.data_ptr<float>(),
-        M, N, K);
-
-    return C;
+torch::Tensor rms_norm_hip(torch::Tensor x, float eps) {
+    auto N = x.size(0);
+    auto C = x.size(1);
+    auto H = x.size(2);
+    auto W = x.size(3);
+    
+    auto out = torch::empty_like(x);
+    
+    int num_nhw = (int)(N * H * W);
+    const int block_size = 256;
+    const int num_blocks = (num_nhw + block_size - 1) / block_size;
+    
+    rms_norm_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(), 
+        out.data_ptr<float>(), 
+        (int)N, (int)C, (int)H, (int)W, 
+        eps
+    );
+    
+    return out;
 }
 """
 
-gemm_module = load_inline(
-    name="gemm_module_float4",
-    cpp_sources=gemm_cpp_source,
-    functions=["gemm_hip"],
+rms_norm_lib = load_inline(
+    name="rms_norm_lib",
+    cpp_sources=rms_norm_source,
+    functions=["rms_norm_hip"],
     verbose=True,
 )
 
 class ModelNew(nn.Module):
-    def __init__(self):
+    def __init__(self, num_features: int, eps: float = 1e-5):
         super(ModelNew, self).__init__()
-        self.gemm_module = gemm_module
+        self.num_features = num_features
+        self.eps = eps
+        self.rms_norm_lib = rms_norm_lib
 
-    def forward(self, A, B):
-        return self.gemm_module.gemm_hip(A, B)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.rms_norm_lib.rms_norm_hip(x, self.eps)

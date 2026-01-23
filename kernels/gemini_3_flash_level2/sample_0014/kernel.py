@@ -6,145 +6,129 @@ import os
 
 os.environ["CXX"] = "hipcc"
 
-cpp_source = """
+fused_bias_gelu_softmax_source = """
 #include <hip/hip_runtime.h>
 #include <torch/extension.h>
 #include <math.h>
 
-#define WARP_SIZE 64
+#define SOFTMAX_BLOCK_SIZE 256
+#define WAVEFRONT_SIZE 64
+#define ELEMENTS_PER_THREAD 32
 
 __device__ inline float gelu(float x) {
-    return 0.5f * x * (1.0f + erff(x * 0.70710678118f));
+    return 0.5f * x * (1.0f + erff(x * M_SQRT1_2));
 }
 
-__device__ inline float blockReduceMax(float val, float* shared) {
-    int tid = threadIdx.x;
-    int lane = tid % WARP_SIZE;
-    int wid = tid / WARP_SIZE;
-
-    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        float other = __shfl_xor(val, offset);
-        if (other > val) val = other;
+__device__ inline void online_softmax_step(float& m, float& s, float x) {
+    if (x > m) {
+        s = s * expf(m - x) + 1.0f;
+        m = x;
+    } else {
+        s = s + expf(x - m);
     }
+}
 
-    if (lane == 0) shared[wid] = val;
-    __syncthreads();
-
-    if (wid == 0) {
-        val = (lane < (blockDim.x / WARP_SIZE)) ? shared[lane] : -1e38f;
-        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-            float other = __shfl_xor(val, offset);
-            if (other > val) val = other;
+__device__ inline void warp_reduce_online_softmax(float& m, float& s) {
+    for (int offset = WAVEFRONT_SIZE / 2; offset > 0; offset >>= 1) {
+        float other_m = __shfl_xor(m, offset, WAVEFRONT_SIZE);
+        float other_s = __shfl_xor(s, offset, WAVEFRONT_SIZE);
+        if (other_m > m) {
+            s = s * expf(m - other_m) + other_s;
+            m = other_m;
+        } else {
+            s = s + other_s * expf(other_m - m);
         }
-        shared[0] = val;
     }
-    __syncthreads();
-    return shared[0];
 }
 
-__device__ inline float blockReduceSum(float val, float* shared) {
-    int tid = threadIdx.x;
-    int lane = tid % WARP_SIZE;
-    int wid = tid / WARP_SIZE;
-
-    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        val += __shfl_xor(val, offset);
-    }
-
-    if (lane == 0) shared[wid] = val;
-    __syncthreads();
-
-    if (wid == 0) {
-        val = (lane < (blockDim.x / WARP_SIZE)) ? shared[lane] : 0.0f;
-        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-            val += __shfl_xor(val, offset);
-        }
-        shared[0] = val;
-    }
-    __syncthreads();
-    return shared[0];
-}
-
-__global__ void bias_gelu_softmax_kernel_v6(float* data, const float* bias, int rows, int cols) {
+__global__ void bias_gelu_softmax_kernel(const float4* __restrict__ input, const float4* __restrict__ bias, float4* __restrict__ output, int rows, int cols_v4) {
     int row = blockIdx.x;
     if (row >= rows) return;
 
-    int tid = threadIdx.x;
-    int block_dim = blockDim.x;
+    const float4* row_input = input + row * cols_v4;
+    float4* row_output = output + row * cols_v4;
 
-    // 512 threads per block, each handles 8192/512 = 16 elements = 4 float4.
-    float4* data_ptr = reinterpret_cast<float4*>(data + row * cols);
-    const float4* bias_ptr = reinterpret_cast<const float4*>(bias);
+    float local_vals[ELEMENTS_PER_THREAD];
+    float m = -1e20f;
+    float s = 0.0f;
 
-    float4 vals[4];
-    float thread_max = -1e38f;
-
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        float4 b = bias_ptr[tid + i * block_dim];
-        float4 v = data_ptr[tid + i * block_dim];
-        
-        v.x = gelu(v.x + b.x);
-        v.y = gelu(v.y + b.y);
-        v.z = gelu(v.z + b.z);
-        v.w = gelu(v.w + b.w);
-        
-        vals[i] = v;
-        
-        float m = max(max(v.x, v.y), max(v.z, v.w));
-        if (m > thread_max) thread_max = m;
+    for (int i = 0; i < ELEMENTS_PER_THREAD / 4; ++i) {
+        int idx = threadIdx.x + i * SOFTMAX_BLOCK_SIZE;
+        if (idx < cols_v4) {
+            float4 v4 = row_input[idx];
+            float4 b4 = bias[idx];
+            float g1 = gelu(v4.x + b4.x);
+            float g2 = gelu(v4.y + b4.y);
+            float g3 = gelu(v4.z + b4.z);
+            float g4 = gelu(v4.w + b4.w);
+            local_vals[i*4 + 0] = g1;
+            local_vals[i*4 + 1] = g2;
+            local_vals[i*4 + 2] = g3;
+            local_vals[i*4 + 3] = g4;
+            online_softmax_step(m, s, g1);
+            online_softmax_step(m, s, g2);
+            online_softmax_step(m, s, g3);
+            online_softmax_step(m, s, g4);
+        }
     }
 
-    extern __shared__ float shared_mem[];
-    float row_max = blockReduceMax(thread_max, shared_mem);
+    __shared__ float shared_m[SOFTMAX_BLOCK_SIZE / WAVEFRONT_SIZE];
+    __shared__ float shared_s[SOFTMAX_BLOCK_SIZE / WAVEFRONT_SIZE];
+    
+    warp_reduce_online_softmax(m, s);
+    
+    if ((threadIdx.x % WAVEFRONT_SIZE) == 0) {
+        shared_m[threadIdx.x / WAVEFRONT_SIZE] = m;
+        shared_s[threadIdx.x / WAVEFRONT_SIZE] = s;
+    }
+    __syncthreads();
 
-    float thread_sum = 0.0f;
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        vals[i].x = expf(vals[i].x - row_max);
-        vals[i].y = expf(vals[i].y - row_max);
-        vals[i].z = expf(vals[i].z - row_max);
-        vals[i].w = expf(vals[i].w - row_max);
-        thread_sum += (vals[i].x + vals[i].y + vals[i].z + vals[i].w);
+    float final_m = shared_m[0];
+    float final_s = shared_s[0];
+    for (int i = 1; i < (SOFTMAX_BLOCK_SIZE / WAVEFRONT_SIZE); ++i) {
+        float other_m = shared_m[i];
+        float other_s = shared_s[i];
+        if (other_m > final_m) {
+            final_s = final_s * expf(final_m - other_m) + other_s;
+            final_m = other_m;
+        } else {
+            final_s = final_s + other_s * expf(other_m - final_m);
+        }
     }
 
-    float row_sum = blockReduceSum(thread_sum, shared_mem);
-    float inv_row_sum = 1.0f / row_sum;
+    float inv_s = 1.0f / final_s;
 
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        vals[i].x *= inv_row_sum;
-        vals[i].y *= inv_row_sum;
-        vals[i].z *= inv_row_sum;
-        vals[i].w *= inv_row_sum;
-        data_ptr[tid + i * block_dim] = vals[i];
+    for (int i = 0; i < ELEMENTS_PER_THREAD / 4; ++i) {
+        int idx = threadIdx.x + i * SOFTMAX_BLOCK_SIZE;
+        if (idx < cols_v4) {
+            float4 res;
+            res.x = expf(local_vals[i*4 + 0] - final_m) * inv_s;
+            res.y = expf(local_vals[i*4 + 1] - final_m) * inv_s;
+            res.z = expf(local_vals[i*4 + 2] - final_m) * inv_s;
+            res.w = expf(local_vals[i*4 + 3] - final_m) * inv_s;
+            row_output[idx] = res;
+        }
     }
 }
 
-torch::Tensor bias_gelu_softmax_hip(torch::Tensor x, torch::Tensor bias) {
-    int rows = x.size(0);
-    int cols = x.size(1);
-    
-    const int block_size = 512;
-    dim3 grid(rows);
-    dim3 block(block_size);
-    
-    size_t shared_mem_size = (block_size / WARP_SIZE) * sizeof(float);
+torch::Tensor bias_gelu_softmax_hip(torch::Tensor input, torch::Tensor bias) {
+    int rows = input.size(0);
+    int cols = input.size(1);
+    int cols_v4 = cols / 4;
+    auto output = torch::empty_like(input);
 
-    bias_gelu_softmax_kernel_v6<<<grid, block, shared_mem_size>>>(
-        x.data_ptr<float>(),
-        bias.data_ptr<float>(),
-        rows,
-        cols
-    );
-    
-    return x;
+    dim3 grid(rows);
+    dim3 block(SOFTMAX_BLOCK_SIZE);
+
+    hipLaunchKernelGGL(bias_gelu_softmax_kernel, grid, block, 0, 0, (const float4*)input.data_ptr<float>(), (const float4*)bias.data_ptr<float>(), (float4*)output.data_ptr<float>(), rows, cols_v4);
+
+    return output;
 }
 """
 
-module = load_inline(
-    name="fused_bias_gelu_softmax_v6",
-    cpp_sources=cpp_source,
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_bias_gelu_softmax_source,
     functions=["bias_gelu_softmax_hip"],
     verbose=True,
 )
@@ -152,23 +136,10 @@ module = load_inline(
 class ModelNew(nn.Module):
     def __init__(self, in_features, out_features):
         super(ModelNew, self).__init__()
-        self.linear = nn.Linear(in_features, out_features)
-        self.module = module
+        self.linear = nn.Linear(in_features, out_features).cuda()
 
     def forward(self, x):
-        # Trying addmm with bias=None and then adding bias in our kernel
-        # torch.addmm is often faster than torch.mm
-        # Actually, let's use torch.addmm with a zero bias if needed or just mm
-        x = torch.mm(x, self.linear.weight.t())
-        x = self.module.bias_gelu_softmax_hip(x, self.linear.bias)
+        # Using torch.mm instead of self.linear(x) to avoid double bias addition
+        z = torch.mm(x, self.linear.weight.t())
+        x = fused_ops.bias_gelu_softmax_hip(z, self.linear.bias)
         return x
-
-def get_inputs():
-    batch_size = 1024
-    in_features = 8192
-    return [torch.rand(batch_size, in_features).cuda()]
-
-def get_init_inputs():
-    in_features = 8192
-    out_features = 8192
-    return [in_features, out_features]

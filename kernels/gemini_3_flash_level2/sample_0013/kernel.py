@@ -1,106 +1,129 @@
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.cpp_extension import load_inline
 import os
 
 os.environ["CXX"] = "hipcc"
 
-gelu_scale_max_source = """
+fused_ops_cpp_source = """
 #include <hip/hip_runtime.h>
 #include <torch/extension.h>
 #include <cmath>
-#include <float.h>
+#include <algorithm>
 
 __device__ inline float gelu(float x) {
-    return 0.5f * x * (1.0f + erff(x * 0.70710678118f));
+    return 0.5f * x * (1.0f + erff(x * M_SQRT1_2));
 }
 
-__global__ void gelu_scale_max_kernel(const float* input, float* output, int batch_size, int seq_len, float scale_factor) {
+__global__ void post_matmul_fused_kernel(
+    const float* __restrict__ input, // shape: (batch_size, num_pooled)
+    float* __restrict__ output,       // shape: (batch_size,)
+    int batch_size,
+    int num_pooled,
+    float scale_factor) {
+
     int row = blockIdx.x;
     if (row >= batch_size) return;
 
     extern __shared__ float shared_data[];
 
-    int tid = threadIdx.x;
-    float max_val = -FLT_MAX;
-
-    for (int i = tid; i < seq_len; i += blockDim.x) {
-        float val = gelu(input[row * seq_len + i]) * scale_factor;
+    float max_val = -1e20f;
+    for (int i = threadIdx.x; i < num_pooled; i += blockDim.x) {
+        float val = gelu(input[row * num_pooled + i]) * scale_factor;
         if (val > max_val) max_val = val;
     }
 
-    shared_data[tid] = max_val;
+    shared_data[threadIdx.x] = max_val;
     __syncthreads();
 
-    // Standard reduction in shared memory
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            if (shared_data[tid + s] > shared_data[tid]) {
-                shared_data[tid] = shared_data[tid + s];
-            }
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shared_data[threadIdx.x] = fmaxf(shared_data[threadIdx.x], shared_data[threadIdx.x + stride]);
         }
         __syncthreads();
     }
 
-    if (tid == 0) {
+    if (threadIdx.x == 0) {
         output[row] = shared_data[0];
     }
 }
 
-torch::Tensor gelu_scale_max_hip(torch::Tensor input, float scale_factor) {
+torch::Tensor post_matmul_fused_hip(torch::Tensor input, float scale_factor) {
     int batch_size = input.size(0);
-    int seq_len = input.size(1);
+    int num_pooled = input.size(1);
+    
     auto output = torch::empty({batch_size}, input.options());
 
     int block_size = 256;
+    dim3 grid(batch_size);
+    dim3 block(block_size);
     int shared_mem_size = block_size * sizeof(float);
-    gelu_scale_max_kernel<<<batch_size, block_size, shared_mem_size>>>(
-        input.data_ptr<float>(), output.data_ptr<float>(), batch_size, seq_len, scale_factor);
+
+    post_matmul_fused_kernel<<<grid, block, shared_mem_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        num_pooled,
+        scale_factor
+    );
 
     return output;
 }
 """
 
-gelu_scale_max_lib = load_inline(
-    name="gelu_scale_max",
-    cpp_sources=gelu_scale_max_source,
-    functions=["gelu_scale_max_hip"],
-    verbose=False,
+post_matmul_fused_lib = load_inline(
+    name="post_matmul_fused_lib",
+    cpp_sources=fused_ops_cpp_source,
+    functions=["post_matmul_fused_hip"],
+    verbose=True,
 )
 
 class ModelNew(nn.Module):
     def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):
         super(ModelNew, self).__init__()
-        self.matmul = nn.Linear(in_features, out_features)
+        self.in_features = in_features
+        self.out_features = out_features
         self.pool_kernel_size = pool_kernel_size
-        self.scale_factor = scale_factor
+        self.scale_factor = float(scale_factor)
         
-        self.register_buffer('W_new', None)
-        self.register_buffer('b_new', None)
-        self.precalculated = False
+        self.matmul = nn.Linear(in_features, out_features)
+        self.post_matmul_fused_lib = post_matmul_fused_lib
+        
+        # We'll use these to cache the pooled weight/bias
+        self.register_buffer('weight_pooled', None)
+        self.register_buffer('bias_pooled', None)
 
-    def _precalculate(self, device):
-        # Average weights and biases
-        weight = self.matmul.weight
-        bias = self.matmul.bias
-        out_features, in_features = weight.shape
-        
-        W_new = weight.view(out_features // self.pool_kernel_size, self.pool_kernel_size, in_features).mean(dim=1)
-        b_new = bias.view(out_features // self.pool_kernel_size, self.pool_kernel_size).mean(dim=1)
-        
-        self.W_new = W_new.to(device)
-        self.b_new = b_new.to(device)
-        self.precalculated = True
+    def _initialize_pooled_weights(self):
+        # pool the weights and bias
+        with torch.no_grad():
+            w = self.matmul.weight
+            b = self.matmul.bias
+            num_pooled = self.out_features // self.pool_kernel_size
+            
+            # W_pooled: (num_pooled, in_features)
+            wp = w[:num_pooled * self.pool_kernel_size, :].view(
+                num_pooled, self.pool_kernel_size, self.in_features
+            ).mean(dim=1)
+            self.weight_pooled = wp
+            
+            if b is not None:
+                bp = b[:num_pooled * self.pool_kernel_size].view(
+                    num_pooled, self.pool_kernel_size
+                ).mean(dim=1)
+                self.bias_pooled = bp
+            else:
+                self.bias_pooled = None
 
     def forward(self, x):
-        if not self.precalculated:
-            self._precalculate(x.device)
+        if self.weight_pooled is None:
+            self._initialize_pooled_weights()
         
-        # Optimized matmul
-        x = F.linear(x, self.W_new, self.b_new)
-        
-        # Apply the fused GELU + Scale + Max kernel
-        return gelu_scale_max_lib.gelu_scale_max_hip(x, float(self.scale_factor))
-
+        # New matmul: (batch_size, in_features) @ (in_features, num_pooled)
+        # weight_pooled is (num_pooled, in_features), so we transpose it.
+        # Ensure x and weights are on the same device and use same dtype
+        x = torch.matmul(x, self.weight_pooled.t())
+        if self.bias_pooled is not None:
+            x = x + self.bias_pooled
+            
+        return self.post_matmul_fused_lib.post_matmul_fused_hip(x, self.scale_factor)

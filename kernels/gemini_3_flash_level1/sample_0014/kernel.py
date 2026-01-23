@@ -6,116 +6,128 @@ import os
 
 os.environ["CXX"] = "hipcc"
 
-softmax_cpp_source = """
+cross_entropy_kernel_source = """
 #include <hip/hip_runtime.h>
 #include <torch/extension.h>
-#include <cmath>
+#include <math.h>
 
-struct MaxSum {
-    float max_val;
-    float sum_val;
-};
-
-__device__ __forceinline__ MaxSum combine(MaxSum a, MaxSum b) {
-    if (a.max_val > b.max_val) {
-        return {a.max_val, a.sum_val + b.sum_val * expf(b.max_val - a.max_val)};
-    } else {
-        return {b.max_val, b.sum_val + a.sum_val * expf(a.max_val - b.max_val)};
+__device__ __forceinline__ float warpReduceMax(float val) {
+    for (int offset = 32; offset > 0; offset /= 2) {
+        val = fmaxf(val, __shfl_xor(val, offset, 64));
     }
+    return val;
 }
 
-__global__ void softmax_online_kernel_v5(const float4* __restrict__ input, float4* __restrict__ output, int batch_size, int dim_v4) {
+__device__ __forceinline__ float warpReduceSum(float val) {
+    for (int offset = 32; offset > 0; offset /= 2) {
+        val += __shfl_xor(val, offset, 64);
+    }
+    return val;
+}
+
+__global__ void cross_entropy_forward_kernel_v4(
+    const float4* predictions,
+    const long* targets,
+    float* losses,
+    int batch_size,
+    int num_classes_v4) {
+
     int row = blockIdx.x;
     if (row >= batch_size) return;
 
-    const float4* row_input = input + row * dim_v4;
-    float4* row_output = output + row * dim_v4;
+    int target = targets[row];
+    const float4* row_preds_v4 = predictions + row * num_classes_v4;
 
-    MaxSum thread_res = {-1e38f, 0.0f};
-
-    // First pass: find max and sum
-    for (int i = threadIdx.x; i < dim_v4; i += blockDim.x) {
-        float4 val4 = row_input[i];
-        thread_res = combine(thread_res, {val4.x, 1.0f});
-        thread_res = combine(thread_res, {val4.y, 1.0f});
-        thread_res = combine(thread_res, {val4.z, 1.0f});
-        thread_res = combine(thread_res, {val4.w, 1.0f});
+    // Step 1: Find max for numerical stability
+    float max_val = -1e38f;
+    for (int i = threadIdx.x; i < num_classes_v4; i += blockDim.x) {
+        float4 p = row_preds_v4[i];
+        max_val = fmaxf(max_val, fmaxf(p.x, fmaxf(p.y, fmaxf(p.z, p.w))));
     }
 
-    static __shared__ MaxSum shared[64];
-    int warp_size = 64; // AMD MI300X
-    int warp_id = threadIdx.x / warp_size;
-    int lane_id = threadIdx.x % warp_size;
-    
-    // Warp-level reduction
-    for (int offset = warp_size / 2; offset > 0; offset /= 2) {
-        float other_max = __shfl_down(thread_res.max_val, offset);
-        float other_sum = __shfl_down(thread_res.sum_val, offset);
-        thread_res = combine(thread_res, {other_max, other_sum});
-    }
+    max_val = warpReduceMax(max_val);
 
-    if (lane_id == 0) shared[warp_id] = thread_res;
+    __shared__ float final_max;
+    __shared__ float final_sum;
+    __shared__ float temp_storage[16]; // 1024 / 64 = 16
+    int lane = threadIdx.x % 64;
+    int wid = threadIdx.x / 64;
+
+    if (lane == 0) temp_storage[wid] = max_val;
     __syncthreads();
 
-    // Final reduction across warps
-    if (warp_id == 0) {
-        MaxSum warp_res = (threadIdx.x < (blockDim.x / warp_size)) ? shared[threadIdx.x] : (MaxSum){-1e38f, 0.0f};
-        for (int offset = warp_size / 2; offset > 0; offset /= 2) {
-            float other_max = __shfl_down(warp_res.max_val, offset);
-            float other_sum = __shfl_down(warp_res.sum_val, offset);
-            warp_res = combine(warp_res, {other_max, other_sum});
-        }
-        if (lane_id == 0) shared[0] = warp_res;
+    if (wid == 0) {
+        float val = (threadIdx.x < (blockDim.x / 64)) ? temp_storage[threadIdx.x] : -1e38f;
+        val = warpReduceMax(val);
+        if (threadIdx.x == 0) final_max = val;
     }
     __syncthreads();
+    max_val = final_max;
 
-    float row_max = shared[0].max_val;
-    float row_sum = shared[0].sum_val;
-    float inv_row_sum = 1.0f / row_sum;
+    // Step 2: Compute sum of exp(x - max)
+    float sum_exp = 0.0f;
+    for (int i = threadIdx.x; i < num_classes_v4; i += blockDim.x) {
+        float4 p = row_preds_v4[i];
+        sum_exp += expf(p.x - max_val);
+        sum_exp += expf(p.y - max_val);
+        sum_exp += expf(p.z - max_val);
+        sum_exp += expf(p.w - max_val);
+    }
 
-    // Second pass: compute output
-    for (int i = threadIdx.x; i < dim_v4; i += blockDim.x) {
-        float4 val4 = row_input[i];
-        float4 res4;
-        res4.x = expf(val4.x - row_max) * inv_row_sum;
-        res4.y = expf(val4.y - row_max) * inv_row_sum;
-        res4.z = expf(val4.z - row_max) * inv_row_sum;
-        res4.w = expf(val4.w - row_max) * inv_row_sum;
-        row_output[i] = res4;
+    sum_exp = warpReduceSum(sum_exp);
+
+    if (lane == 0) temp_storage[wid] = sum_exp;
+    __syncthreads();
+
+    if (wid == 0) {
+        float val = (threadIdx.x < (blockDim.x / 64)) ? temp_storage[threadIdx.x] : 0.0f;
+        val = warpReduceSum(val);
+        if (threadIdx.x == 0) final_sum = val;
+    }
+    __syncthreads();
+    sum_exp = final_sum;
+
+    // Step 3: Compute final loss for the row
+    if (threadIdx.x == 0) {
+        const float* row_preds = reinterpret_cast<const float*>(row_preds_v4);
+        float log_sum_exp = logf(sum_exp) + max_val;
+        losses[row] = log_sum_exp - row_preds[target];
     }
 }
 
-torch::Tensor softmax_hip(torch::Tensor input) {
-    auto batch_size = input.size(0);
-    auto dim = input.size(1);
-    auto output = torch::empty_like(input);
+torch::Tensor cross_entropy_hip(torch::Tensor predictions, torch::Tensor targets) {
+    int batch_size = predictions.size(0);
+    int num_classes = predictions.size(1);
+    int num_classes_v4 = num_classes / 4;
 
-    const int block_size = 256;
-    const int num_blocks = batch_size;
-    const int dim_v4 = dim / 4;
+    auto losses = torch::empty({batch_size}, predictions.options());
 
-    softmax_online_kernel_v5<<<num_blocks, block_size>>>(
-        (const float4*)input.data_ptr<float>(),
-        (float4*)output.data_ptr<float>(),
+    // Use larger block size
+    int threads_per_block = 512;
+
+    cross_entropy_forward_kernel_v4<<<batch_size, threads_per_block>>>(
+        reinterpret_cast<const float4*>(predictions.data_ptr<float>()),
+        targets.data_ptr<long>(),
+        losses.data_ptr<float>(),
         batch_size,
-        dim_v4
+        num_classes_v4
     );
 
-    return output;
+    return losses.mean();
 }
 """
 
-softmax_module = load_inline(
-    name="softmax_online_v5",
-    cpp_sources=softmax_cpp_source,
-    functions=["softmax_hip"],
+cross_entropy_lib = load_inline(
+    name="cross_entropy_lib",
+    cpp_sources=cross_entropy_kernel_source,
+    functions=["cross_entropy_hip"],
     verbose=True,
 )
 
 class ModelNew(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.softmax_hip = softmax_module.softmax_hip
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.cross_entropy_lib = cross_entropy_lib
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.softmax_hip(x)
+    def forward(self, predictions, targets):
+        return self.cross_entropy_lib.cross_entropy_hip(predictions, targets)
