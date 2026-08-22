@@ -27,7 +27,8 @@ kernel-arena/exports/
 └── waferbench-nvfp4-b200/
 ```
 
-The KernelArena application remains in [`wafer-ai/kernel-arena`](https://github.com/wafer-ai/kernel-arena).
+The original KernelArena data repository history is preserved in
+`kernel-arena/archive/kernel-arena-full-history.bundle`.
 
 ## Repository Scope
 
